@@ -24,7 +24,11 @@ public:
 private:
     std::shared_ptr<DecisionContext> ctx_;
     int stable_frames_ = 0;
+    // 掃描旋轉方向：+1 順時鐘、-1 逆時鐘。第一次 tick 由 sweep_direction 埠
+    // 初始化（見 search_target.cpp），之後每看到一次目標就依目標在畫面左右
+    // 更新，所以「跟丟後往剛才看到的方向回轉」的行為不受影響。
     int sweep_direction_ = 1;
+    bool sweep_direction_initialised_ = false;
 };
 
 class ApproachTarget : public BT::ActionNodeBase {
@@ -67,6 +71,12 @@ private:
     rclcpp::Time start_time_;
     bool started_ = false;
     double target_yaw_ = 0.0;
+    // 被 halt 打斷前已經走掉的時間。沒有這個累計，避障每觸發一次盲走就從 0 重
+    // 新計時，一趟 10 秒的盲走會走成兩趟。
+    double elapsed_before_halt_ = 0.0;
+    // 航向鎖只在整段盲走的最開頭取一次。避障結束後重新取的話，鎖住的會是閃避
+    // 完的歪掉航向，等於把避障的側移永久烙進航向裡。
+    bool yaw_locked_ = false;
 };
 
 class TurnToYaw : public BT::ActionNodeBase {

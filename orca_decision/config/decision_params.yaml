@@ -51,10 +51,27 @@ decision_node:
     check_bottom_clear_center_deadband: 20.0
 
     # BumpFlare
+    # ApproachTarget 停在離柱 1.0 m，surge 25 撞過去用不到 15 秒；多出來的時間
+    # 是「撞完繼續往前衝」，往對面池壁去（碰壁 −5/次，5 次自動 abort）。三根柱
+    # 子就是三次撞牆機會，所以砍到 5 秒。
+    # 這一行現在是「呼叫端沒在 XML 指定 timeout 時」的後備值。優先序已經翻正
+    # （bump_flare.cpp）：XML 的 timeout port 優先，沒寫才落回這裡。撞柱那三個
+    # 呼叫端都在 trees.xml 明寫 timeout="5.0"，所以改這一行不會影響它們。
     bump_flare_surge: 25.0
-    bump_flare_timeout_sec: 15.0
+    bump_flare_timeout_sec: 5.0
 
     # WaitForFlareOrder
+    # 規則是過門成功「之後」才告知順序：裁判判定 → 公布 → 隊員看板子 → 輸入 →
+    # 送出 → 訊號傳到水下。原本的 5.0 秒不可能等到，而逾時只留一行 WARN 就靜默
+    # 改用 default_order，現場看不出異常，艇照樣去撞柱、只是順序錯 —— 60 分順序
+    # 獎金就這樣丟掉。
+    #
+    # default_order 一定要留著（不要設成空字串）：解析結果為空時
+    # wait_for_flare_order.cpp:98-103 回 FAILURE，而 trees.xml 的
+    # <SubTree ID="CommunicationTask"/> 是裸的、沒有 Fallback 接住，FAILURE 會一路
+    # 往上讓 FinalMission 的主 Sequence 失敗 → 最外層 ReactiveFallback 兩個分支
+    # 全滅 → FinishMission 永遠不執行、艇不上浮，連 5 分結束獎勵和時間獎勵一起賠掉。
+    # 亂猜順序至少還有機會拿到每根 20 分的撞柱分。
     wait_for_flare_order_timeout_sec: 5.0
     wait_for_flare_order_default_order: "rby"
 
