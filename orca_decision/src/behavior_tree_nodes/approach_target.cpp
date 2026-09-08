@@ -24,7 +24,13 @@ ApproachTarget::ApproachTarget(const std::string &name,
 
 BT::PortsList ApproachTarget::providedPorts() {
   return {BT::InputPort<std::string>("label"),
-          BT::InputPort<double>("distance")};
+          BT::InputPort<double>("distance"),
+          // 深度失效時的備援到位判準：偵測框高度（640 張量像素）達到這個值就
+          // 算走到了。0 = 停用，維持原本「只認深度」的行為，所以既有呼叫端
+          // （閘門、藍桶）完全不受影響。
+          BT::InputPort<double>("min_height_px", 0.0,
+                                "Bbox height (px) that counts as arrival when "
+                                "depth is unavailable; 0 disables")};
 }
 
 BT::NodeStatus ApproachTarget::tick() {
@@ -38,6 +44,9 @@ BT::NodeStatus ApproachTarget::tick() {
       !getInput<double>("distance", target_distance)) {
     throw BT::RuntimeError("missing required inputs");
   }
+
+  double min_height_px = 0.0;
+  getInput<double>("min_height_px", min_height_px);
 
   ctx_->current_action = name();
   ctx_->target_label = label;
@@ -56,6 +65,7 @@ BT::NodeStatus ApproachTarget::tick() {
     if (lost_frames_ > 8) {
       lost_frames_ = 0;
       blind_frames_ = 0;
+      height_stable_frames_ = 0;
       stable_frames_ = 0;
       ctx_->wrench_adapter->setCommand(MotionCommand());
       return BT::NodeStatus::FAILURE;
@@ -94,6 +104,35 @@ BT::NodeStatus ApproachTarget::tick() {
 
   // Forward movement (decelerate as we get closer).
   if (obj->distance <= 0.0f) {
+    // 視覺備援到位判準。沒有這一段的話 blind 分支「只能失敗」：SUCCESS 唯一的
+    // 出口在上面，而那裡要求 distance > 0，所以深度一直估不出來時這個節點必然
+    // 盲衝滿 kMaxBlindFrames 然後回 FAILURE。
+    //
+    // flare 正好是最會踩到這件事的目標：桿子直徑 1.6 cm，細長框裡取到的深度多
+    // 半是背景或根本沒有有效點（depth_perception_node 的 _estimate_object 回
+    // NaN → distance = −1）。三根柱子每根 retry 三次全數失敗 → SkipFlare，
+    // 60 分整包歸零。
+    //
+    // 用框高而不是框寬，是因為桿子在畫面上就是「高、窄」，寬度只有幾像素、量
+    // 化雜訊佔比極高，高度才是隨距離單調變化又量得準的那一維。做法與倉庫裡既
+    // 有的 gate_posts_success_gap_px 同一套路：深度不可靠時退回像素幾何。
+    if (min_height_px > 0.0 &&
+        static_cast<double>(obj->height) >= min_height_px) {
+      height_stable_frames_++;
+      if (height_stable_frames_ >= 5) {
+        blind_frames_ = 0;
+        height_stable_frames_ = 0;
+        stable_frames_ = 0;
+        ctx_->wrench_adapter->setCommand(MotionCommand());
+        ctx_->debug_msg = "Arrived (visual): " + label + " h=" +
+                          std::to_string(obj->height) + " >= " +
+                          std::to_string(min_height_px);
+        return BT::NodeStatus::SUCCESS;
+      }
+    } else {
+      height_stable_frames_ = 0;
+    }
+
     blind_frames_++;
     ctx_->debug_msg = "Approaching (visual): " + label + " (h=" +
                       std::to_string(obj->height) + ", " +
@@ -101,6 +140,7 @@ BT::NodeStatus ApproachTarget::tick() {
                       std::to_string(kMaxBlindFrames) + ")";
     if (blind_frames_ > kMaxBlindFrames) {
       blind_frames_ = 0;
+      height_stable_frames_ = 0;
       stable_frames_ = 0;
       ctx_->wrench_adapter->setCommand(MotionCommand());
       return BT::NodeStatus::FAILURE;
@@ -112,6 +152,7 @@ BT::NodeStatus ApproachTarget::tick() {
     }
   } else {
     blind_frames_ = 0;
+    height_stable_frames_ = 0;
     const float dist_error = obj->distance - target_distance;
     if (dist_error <= 0.0f) {
       // Overshot: coast to a stop instead of pushing further in.
@@ -137,6 +178,7 @@ void ApproachTarget::halt() {
   stable_frames_ = 0;
   lost_frames_ = 0;
   blind_frames_ = 0;
+  height_stable_frames_ = 0;
   if (ctx_) {
     ctx_->wrench_adapter->setCommand(MotionCommand());
   }

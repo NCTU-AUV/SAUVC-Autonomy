@@ -43,6 +43,10 @@ private:
     int stable_frames_ = 0;
     int lost_frames_ = 0;
     int blind_frames_ = 0;
+    // 深度失效時改用「框有多高」判斷到位（min_height_px 埠）。與 stable_frames_
+    // 分開計數是刻意的：兩條到位路徑各自累計，深度時有時無地跳動時才不會互相
+    // 把對方的計數清掉、湊不滿任何一邊的門檻。
+    int height_stable_frames_ = 0;
 };
 
 class FinalAlignTarget : public BT::ActionNodeBase {
