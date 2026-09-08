@@ -157,11 +157,42 @@ void RegisterBehaviorTreeNodes(BT::BehaviorTreeFactory& factory, std::shared_ptr
         });
 
     // ============================================================
+    // New nodes — Qualification: gate inferred from a post pair
+    // ============================================================
+    factory.registerBuilder<SearchGateByPosts>("SearchGateByPosts",
+        [ctx](const std::string& name, const BT::NodeConfiguration& config) {
+            auto node = std::make_unique<SearchGateByPosts>(name, config);
+            node->setContext(ctx);
+            return node;
+        });
+
+    factory.registerBuilder<ApproachGateByPosts>("ApproachGateByPosts",
+        [ctx](const std::string& name, const BT::NodeConfiguration& config) {
+            auto node = std::make_unique<ApproachGateByPosts>(name, config);
+            node->setContext(ctx);
+            return node;
+        });
+
+    factory.registerBuilder<AlignGateByPosts>("AlignGateByPosts",
+        [ctx](const std::string& name, const BT::NodeConfiguration& config) {
+            auto node = std::make_unique<AlignGateByPosts>(name, config);
+            node->setContext(ctx);
+            return node;
+        });
+
+    // ============================================================
     // New nodes — Mission Control
     // ============================================================
     factory.registerBuilder<WaitForStart>("WaitForStart",
         [ctx](const std::string& name, const BT::NodeConfiguration& config) {
             auto node = std::make_unique<WaitForStart>(name, config);
+            node->setContext(ctx);
+            return node;
+        });
+
+    factory.registerBuilder<MissionTimeLeft>("MissionTimeLeft",
+        [ctx](const std::string& name, const BT::NodeConfiguration& config) {
+            auto node = std::make_unique<MissionTimeLeft>(name, config);
             node->setContext(ctx);
             return node;
         });

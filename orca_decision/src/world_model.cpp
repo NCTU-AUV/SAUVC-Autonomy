@@ -172,6 +172,92 @@ std::optional<TrackedObject> WorldModel::getObjectNearestImageCenter(
     return best;
 }
 
+std::optional<GatePostPair> WorldModel::getGatePostPair(
+    const std::vector<std::string>& labels, const GatePostCriteria& criteria) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    removeStaleObjects();
+
+    // 1. Keep only boxes that carry one of the accepted labels and are shaped
+    //    like a post. A whole gate seen with its top bar is wider than it is
+    //    tall, so the aspect test is also what stops this function from
+    //    mistaking one full-gate detection for a post. Recorded runs put the
+    //    flares — physically the same thin vertical cylinder as a gate post —
+    //    at h/w 3 to 5, so the default threshold of 1.8 has real margin.
+    std::vector<TrackedObject> posts;
+    for (const auto& obj : tracked_objects_) {
+        if (std::find(labels.begin(), labels.end(), obj.label) == labels.end()) continue;
+        if (obj.width <= 0.0f || obj.height <= 0.0f) continue;
+        if (obj.height / obj.width < criteria.min_aspect_ratio) continue;
+        posts.push_back(obj);
+    }
+    if (posts.size() < 2) {
+        return std::nullopt;
+    }
+
+    // 2. Sort by image x and only ever pair *adjacent* boxes. This is the one
+    //    place the result is not literally "the two nearest posts": a pair with
+    //    a third post between them is refused even if those two are the closest
+    //    pair in the frame. That refusal is the point — steering at the midpoint
+    //    of such a pair drives straight into whatever sits between them. With
+    //    two gates in view there are four posts, and the outer two would
+    //    otherwise be the widest, most gate-looking pair in the frame, aiming
+    //    the vehicle at the open water between the gates. Adjacency rules that
+    //    out without needing to know which post belongs to which gate.
+    std::sort(posts.begin(), posts.end(),
+              [](const TrackedObject& a, const TrackedObject& b) { return a.cx < b.cx; });
+
+    std::optional<GatePostPair> best;
+    float best_score = std::numeric_limits<float>::max();
+
+    for (size_t i = 0; i + 1 < posts.size(); ++i) {
+        const TrackedObject& left = posts[i];
+        const TrackedObject& right = posts[i + 1];
+
+        const float gap = right.cx - left.cx;
+        if (gap < criteria.min_gap_px || gap > criteria.max_gap_px) continue;
+
+        // Two posts of one gate are the same physical length at nearly the same
+        // range, so they subtend nearly the same pixel height. A post paired
+        // with something else — a far post, a flare, half a reflection — fails
+        // here.
+        const float taller = std::max(left.height, right.height);
+        const float shorter = std::min(left.height, right.height);
+        if (shorter <= 0.0f || taller / shorter > criteria.max_height_ratio) continue;
+
+        // 3. Rank by range. Prefer resolved depth; fall back to apparent height,
+        //    which is monotone in closeness for a fixed-length post. The two are
+        //    not comparable to each other, so depth-resolved pairs always beat
+        //    height-only ones rather than competing on a mixed scale.
+        float distance = -1.0f;
+        int valid = 0;
+        float sum = 0.0f;
+        if (left.distance > 0.0f)  { sum += left.distance;  ++valid; }
+        if (right.distance > 0.0f) { sum += right.distance; ++valid; }
+        if (valid > 0) {
+            distance = sum / static_cast<float>(valid);
+        }
+
+        constexpr float kHeightOnlyPenalty = 1000.0f;
+        const float score = (distance > 0.0f)
+                                ? distance
+                                : kHeightOnlyPenalty + 1.0f / std::max(taller, 1.0f);
+
+        if (score < best_score) {
+            best_score = score;
+            GatePostPair pair;
+            pair.left = left;
+            pair.right = right;
+            pair.center_cx = 0.5f * (left.cx + right.cx);
+            pair.center_cy = 0.5f * (left.cy + right.cy);
+            pair.gap_px = gap;
+            pair.distance = distance;
+            best = pair;
+        }
+    }
+
+    return best;
+}
+
 std::vector<TrackedObject> WorldModel::getObjects() {
     std::lock_guard<std::mutex> lock(mutex_);
     removeStaleObjects();

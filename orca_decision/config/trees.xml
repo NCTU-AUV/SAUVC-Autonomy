@@ -33,17 +33,32 @@
   <!-- 決賽專用過閘門子樹：可獨立調整盲走時長 -->
   <BehaviorTree ID="PassGateFinalsProcedure">
     <Sequence>
-      <RetryUntilSuccessful num_attempts="30">
-        <Sequence>
-          <SearchTarget label="gate"/>
-          <Timeout msec="60000">
-            <ApproachTarget label="gate" distance="3.0"/>
-          </Timeout>
-          <FinalAlignTarget label="gate"/>
-        </Sequence>
-      </RetryUntilSuccessful>
-      <!-- 決賽專用時長：10.0 秒 -->
-      <BlindForward duration="10.0" heading_lock="true"/>
+      <!-- P0-3：SearchTarget 找不到目標時永遠回 RUNNING，不會失敗，所以外層的
+           RetryUntilSuccessful 從來輪不到 —— 濁水或逆光時艇會原地轉到比賽結束。
+           結構照抄 AcquireGateWholeBox：搜尋 30 s 上限、整段 90 s 上限。
+
+           Fallback + AlwaysSuccess 讓 BlindForward「無論如何都會執行」：門就在
+           正前方約 16 m，90 秒認不出來的話瞎衝過去仍有機會，總比原地轉完 15
+           分鐘好。⚠ 代價是搜尋逾時後艇的航向是掃描停在哪就是哪，盲走方向不
+           保證朝著門，也可能撞上池壁（−5）。這是刻意接受的賭注。 -->
+      <Fallback>
+        <Timeout msec="90000">
+          <RetryUntilSuccessful num_attempts="6">
+            <Sequence>
+              <Timeout msec="30000">
+                <SearchTarget label="gate"/>
+              </Timeout>
+              <Timeout msec="60000">
+                <ApproachTarget label="gate" distance="3.0"/>
+              </Timeout>
+              <FinalAlignTarget label="gate"/>
+            </Sequence>
+          </RetryUntilSuccessful>
+        </Timeout>
+        <AlwaysSuccess/>
+      </Fallback>
+      <!-- 決賽專用時長：16.0 秒 -->
+      <BlindForward duration="16.0" heading_lock="true"/>
     </Sequence>
   </BehaviorTree>
 
@@ -51,7 +66,15 @@
     <Sequence>
       <!-- WaitForStart is simulated by the decision node triggering BT tick based on topic -->
       <SetCamera mode="realsense"/>
-      <SetDepth depth="0.2"/>
+      <!-- 資格賽門：橫桿貼水面（q_gate/model.sdf 的 top_bar 在 z=0，半徑 0.04），
+           立柱往下 1.00 m，沒有底桿 → 可穿過的窗口是水深 0 ~ 1.00 m。
+           艇體上緣 +0.230 / 下緣 -0.140（orca_auv/model.sdf 的 visual；collision
+           box 兩端都不可信，上端少 15 mm、下端根本不含底部框架）。
+             最淺 0.04 + 0.230 = 0.27（再淺就撞橫桿）
+             最深 1.00 - 0.140 = 0.86（再深就從柱子底下溜過去，不算過門）
+           取 0.55，上下各留約 0.31 m。原本的 0.2 讓上緣只在水下 0.12 m，
+           波浪和水面反光都直接吃到，而且已經觸發 set_depth.cpp 的 0.35 下限。 -->
+      <SetDepth depth="0.55"/>
 
       <SubTree ID="PassGateProcedure"/>
 
@@ -63,39 +86,319 @@
     </Sequence>
   </BehaviorTree>
 
-  <BehaviorTree ID="FinalMission">
+  <!-- ============================================================
+       資格賽變體 A：回程不再找門，轉完 180 度直接盲走衝過去
+       ============================================================
+       與 QualificationMission 的差別只在回程段。QualificationMission 回程跑
+       的是完整的 PassGateProcedure（Search→Approach→FinalAlign→BlindForward），
+       這棵樹把回程換成單一個 BlindForward。
+
+       duration 是這棵樹唯一需要調的旋鈕，20.0 是這樣算出來的：去程
+       ApproachTarget 停在離門 3.0 m，接著盲走 16 s，所以回程要走完「16 s 的
+       行程 + 3 m + 穿過門的餘裕」才算脫離。單純沿用 16.0 會在門口前後停下，
+       所以取 16 s 再加約 4 s 的餘裕。實測後請直接調這個數字。
+
+       heading_lock="true"：BlindForward 會在起跑當下記住 yaw 並全程 P 控制回
+       去。TurnToYaw 收斂到 align_yaw_threshold（0.1 rad ≈ 5.7 度）就結束，殘
+       餘的角度誤差在 20 s 的直線盲走裡會累積成明顯側偏，靠這個鎖住。 -->
+  <!-- ============================================================
+       資格賽變體 B：由「兩根柱子」推得閘門位置
+       ============================================================
+       想法：不要跟誤判對抗，去利用它。7 類決賽模型有四個 flare 類別，而
+       flare 在影像上就是「細長垂直圓柱」—— 跟一根閘門立柱同一種形狀。橫桿被
+       水面吃掉之後，模型很可能把兩根立柱各判成某種 flare。
+
+       label 是逗號分隔的清單，而且**配對時不要求兩根同標籤**。這是刻意的，
+       而且是這段能同時服務兩種模型的原因：
+
+         · 1 類 qualification 模型：立柱只可能被標成 gate
+         · 7 類 finals 模型：立柱可能被標成任一種 flare，且水下打光不均常讓
+           同一對柱子左紅右橘
+
+       清單裡同時放 gate 和四種 flare，兩種情況就都涵蓋了，不需要兩棵樹。
+       把 gate 混進清單是安全的：細長比門檻（預設 1.8）會擋掉整門框 —— 實測
+       整門框的 h/w 中位數是 0.66～0.93，離 1.8 很遠。
+
+       ⚠ flare 那一半的前提沒被驗證過：模擬裡 q_gate 的立柱是灰白色（material diffuse
+       0.85 0.85 0.85），而 flare 類別主要靠顏色判別（red_flare 是
+       0.80 0.06 0.06），幾何也不同（立柱 1.6 m / r=2 cm，flare 是 0.8 m /
+       r=0.8 cm 加底盤加頂球）。所以在**模擬**裡這條路很可能不會觸發。真實
+       場地的閘門柱顏色若是紅或橘，成功率會高很多。這也是下面那棵 fallback
+       版本存在的理由 —— 它讓這個不確定性變成零成本。
+
+       兩種模型都能用：7 類（finals）走 flare 那條，1 類（qualification）走
+       gate 那條。清單裡用不到的標籤只是永遠不會匹配，沒有副作用。 -->
+  <!-- SearchGateByPosts 跟 SearchTarget 一樣，找不到目標時永遠回傳 RUNNING、
+       不會失敗。沒有 Timeout 的話配不到柱子就整個任務無限期掛住（實測 6 輪
+       有 5 輪是這樣，全靠外部上限才停下來，實機上沒有那個上限）。
+       結構刻意做成跟 AcquireGateWholeBox 對稱。 -->
+  <BehaviorTree ID="AcquireGateByPostPair">
+    <Timeout msec="90000">
+      <RetryUntilSuccessful num_attempts="6">
+        <Sequence>
+          <Timeout msec="30000">
+            <SearchGateByPosts label="gate,red_flare,blue_flare,yellow_flare,orange_flare"/>
+          </Timeout>
+          <Timeout msec="60000">
+            <ApproachGateByPosts label="gate,red_flare,blue_flare,yellow_flare,orange_flare" distance="3.0"/>
+          </Timeout>
+          <AlignGateByPosts label="gate,red_flare,blue_flare,yellow_flare,orange_flare"/>
+        </Sequence>
+      </RetryUntilSuccessful>
+    </Timeout>
+  </BehaviorTree>
+
+  <!-- 整門框版的取得段。跟 PassGateProcedure 的前半相同，但多包了一層
+       Timeout —— 這是 fallback 能運作的關鍵：SearchTarget 找不到目標時會
+       永遠回傳 RUNNING，不會失敗，所以沒有 Timeout 的話 Fallback 永遠不會
+       輪到第二個分支。
+
+       交棒的判準是「跟丟次數」而不是牆鐘時間：num_attempts="2"。跑得順的時候
+       第 1 次就成功，這個值完全不影響它；橫桿被水面吃掉時表現為 Search 抓到
+       又跟丟的反覆震盪，跟丟兩次就交棒，不必耗滿外層那 90 秒。
+
+       外層的 90 秒維持不動 —— 它涵蓋 Search + Approach + FinalAlign 全程，而
+       從 9.46 m 接近到 3 m 本來就要時間，砍短會把正常運作的路線一起砍掉。 -->
+  <BehaviorTree ID="AcquireGateWholeBox">
+    <Timeout msec="90000">
+      <RetryUntilSuccessful num_attempts="2">
+        <Sequence>
+          <Timeout msec="15000">
+            <SearchTarget label="gate"/>
+          </Timeout>
+          <Timeout msec="60000">
+            <ApproachTarget label="gate" distance="3.0"/>
+          </Timeout>
+          <FinalAlignTarget label="gate"/>
+        </Sequence>
+      </RetryUntilSuccessful>
+    </Timeout>
+  </BehaviorTree>
+
+  <!-- 先試整門框，跟丟兩次就改用柱子配對，兩條都不行才落到純盲走。
+       任何一條成功之後都一律盲走穿過。 -->
+  <BehaviorTree ID="PassGateWithPostPairFallbackProcedure">
     <Sequence>
-      
-      <SetCamera mode="realsense"/>
-      <SetDepth depth="0.7"/>
-
-      <ReactiveFallback>
-        <AvoidObstacle sticky_time="1.0"/>
-        <SubTree ID="PassGateFinalsProcedure"/>
-      </ReactiveFallback>
-
-      <SetDepth depth="0.15"/>
-      <SubTree ID="TargetAcquisition" drop_pose="{drop_pose}"/>
-
-      <SetCamera mode="realsense"/>
-      <SetDepth depth="0.7"/>
-      <SubTree ID="PassGateFinalsProcedure"/>
-
-      <SubTree ID="CommunicationTask"/>
-
-      <SetDepth depth="0.15"/>
-      <SubTree ID="TargetReacquisition" drop_pose="{drop_pose}"/>
-
-      <FinishMission/>
+      <Fallback>
+        <SubTree ID="AcquireGateWholeBox"/>
+        <SubTree ID="AcquireGateByPostPair"/>
+        <!-- 兩條視覺路線都失敗時不要讓整棵樹跟著失敗，落下來吃共用的
+             BlindForward。注意這一衝是朝「當下的朝向」，前面搜尋期間若轉過
+             方向就不保證對著門 —— 它的作用是不要停在水裡，不是保證過門。 -->
+        <AlwaysSuccess/>
+      </Fallback>
+      <BlindForward duration="16.0" heading_lock="true"/>
     </Sequence>
+  </BehaviorTree>
+
+  <!-- 過門（整門框優先，退回柱子配對）→ 轉 180 → 盲走過門 → 上浮 -->
+  <BehaviorTree ID="QualificationMissionGateOrFlares">
+    <Sequence>
+      <SetCamera mode="realsense"/>
+      <!-- 資格賽門：橫桿貼水面（q_gate/model.sdf 的 top_bar 在 z=0，半徑 0.04），
+           立柱往下 1.00 m，沒有底桿 → 可穿過的窗口是水深 0 ~ 1.00 m。
+           艇體上緣 +0.230 / 下緣 -0.140（orca_auv/model.sdf 的 visual；collision
+           box 兩端都不可信，上端少 15 mm、下端根本不含底部框架）。
+             最淺 0.04 + 0.230 = 0.27（再淺就撞橫桿）
+             最深 1.00 - 0.140 = 0.86（再深就從柱子底下溜過去，不算過門）
+           取 0.55，上下各留約 0.31 m。原本的 0.2 讓上緣只在水下 0.12 m，
+           波浪和水面反光都直接吃到，而且已經觸發 set_depth.cpp 的 0.35 下限。 -->
+      <SetDepth depth="0.55"/>
+
+      <SubTree ID="PassGateWithPostPairFallbackProcedure"/>
+
+      <TurnToYaw degrees="180"/>
+      <BlindForward duration="20.0" heading_lock="true"/>
+
+      <SetDepth depth="0.0"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="QualificationMissionBlindReturn">
+    <Sequence>
+      <SetCamera mode="realsense"/>
+      <!-- 資格賽門：橫桿貼水面（q_gate/model.sdf 的 top_bar 在 z=0，半徑 0.04），
+           立柱往下 1.00 m，沒有底桿 → 可穿過的窗口是水深 0 ~ 1.00 m。
+           艇體上緣 +0.230 / 下緣 -0.140（orca_auv/model.sdf 的 visual；collision
+           box 兩端都不可信，上端少 15 mm、下端根本不含底部框架）。
+             最淺 0.04 + 0.230 = 0.27（再淺就撞橫桿）
+             最深 1.00 - 0.140 = 0.86（再深就從柱子底下溜過去，不算過門）
+           取 0.55，上下各留約 0.31 m。原本的 0.2 讓上緣只在水下 0.12 m，
+           波浪和水面反光都直接吃到，而且已經觸發 set_depth.cpp 的 0.35 下限。 -->
+      <SetDepth depth="0.55"/>
+
+      <!-- 去程：與 QualificationMission 完全相同，共用同一棵子樹 -->
+      <SubTree ID="PassGateProcedure"/>
+
+      <TurnToYaw degrees="180"/>
+
+      <!-- 回程：不再 Search/Approach/FinalAlign，直接盲走衝過門 -->
+      <BlindForward duration="20.0" heading_lock="true"/>
+
+      <SetDepth depth="0.0"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 全域時間預算（P1-5）。原本這棵樹是一條裸的 Sequence，FinishMission 排
+       在最後一項 —— 只要前面任何一段卡住，上浮就永遠輪不到，5 分結束獎勵和
+       時間獎勵一起歸零。實際會卡住的是 TargetReacquisition：找球段最壞
+       100 × (30 s 搜 + 45 s 螺旋) = 7500 秒，遠超整場的 900 秒。
+
+       這裡用兩層機制處理，職責不同：
+
+       1) 最外層 ReactiveFallback 的第一分支 = 硬性截止。ReactiveFallback 每個
+          tick 都從第一個子節點重新評估，所以剩餘時間一跌破門檻，Inverter 就
+          把 FAILURE 翻成 SUCCESS、FinishMission 送出上浮，然後 haltChildren()
+          把還在 RUNNING 的主線整條中斷掉。關鍵是 FinishMission 不再「排在」
+          卡住的節點後面，而是跟它並行、隨時可以搶佔。
+
+       2) MissionTimeLeft 前置守衛 = 不要開始一件註定跑不完、而且做一半也
+          拿不到分的事。目前只有撿球段掛這個守衛，撞柱段刻意沒有 —— 判準是
+          「這段能不能部分得分」，理由寫在各自的節點旁邊。
+
+       只有 (1) 而沒有 (2) 也能保住 5 分，但會拖到 855 秒才上浮，時間獎勵
+       (900 − T) × 0.03 幾乎全丟。(2) 才是讓艇早點上浮的那一半。 -->
+  <BehaviorTree ID="FinalMission">
+    <ReactiveFallback>
+
+      <!-- 硬性截止：剩 45 秒就無條件上浮。45 是留給艇實際浮起來的時間，
+           不是餘裕 —— 上浮本身要幾秒到十幾秒。 -->
+      <Sequence>
+        <Inverter>
+          <MissionTimeLeft seconds="45"/>
+        </Inverter>
+        <FinishMission/>
+      </Sequence>
+
+      <Sequence>
+        <SetCamera mode="realsense"/>
+        <SetDepth zone="gate"/>
+
+        <ReactiveFallback>
+          <AvoidObstacle sticky_time="1.0"/>
+          <SubTree ID="PassGateFinalsProcedure"/>
+        </ReactiveFallback>
+
+        <!-- 投球區池深約 1.20 m，桶高 0.30 m 坐池底 → 桶口在水深 0.90 m。
+             艇體上緣在原點上方 0.23 m（orca_auv/model.sdf：主體圓柱中心
+             +0.115、半徑 0.115），深度回授量的是原點，所以原本的 0.15 會讓
+             上緣露出水面約 8 cm —— 規則上「任何時候破水面 = attempt 立即結束」。
+
+             zone="drop" 由現場池深換算：pool_depth_drop_m（操作員在網頁輸入的
+             投球區池深）減 zone_offset_drop_m（預設 0.90）。H=1.20 時算出的原始
+             目標是 0.30，但這低於 set_depth.cpp 的 kMinDepth（0.35，破水面
+             保險），會被 SetDepth 頂到 0.35 才真正發布 —— 這不是這次改動造成
+             的，trees.xml 原本硬寫的 depth="0.30" 一直都被同一條 clamp 頂到
+             0.35，行為完全一致。實際下潛深度 0.35：上緣停在水下 0.12 m，離桶口
+             0.55 m。
+
+             撿球段（TargetReacquisition 前）也是同一個 zone="drop"，放球和撿球
+             要停的深度相同（都是 0.30），所以共用同一個 SetDepth 目標。 -->
+        <SetDepth zone="drop"/>
+        <!-- 投球是可選任務。ForceSuccess 讓「找不到桶」只損失這 30 分，不會讓
+             整條 Sequence 失敗、把後面 60 分的撞柱和上浮獎勵一起帶走。 -->
+        <ForceSuccess>
+          <SubTree ID="TargetAcquisition" drop_pose="{drop_pose}"/>
+        </ForceSuccess>
+
+        <SetCamera mode="realsense"/>
+        <SetDepth zone="gate"/>
+        <!-- 回程也要避障。原本這裡是裸的，只有去程（上面那段）包了
+             ReactiveFallback —— 但回程一樣要穿過離起始牆 4~8 m 的橘 flare 區，
+             而橘 flare 是全場唯一「碰一下 attempt 立即終止」的道具，不是扣分。
+             防一半等於沒防。
+
+             這一改的前提是 BlindForward 的 halt 累計已經修好（見
+             blind_forward.cpp）：ReactiveFallback 觸發避障時會 halt 整棵過門子
+             樹，盲走跟著中斷。修好之前每中斷一次就多走一趟完整的 10 秒，補在
+             回程只會把那個坑挖成兩個。 -->
+        <ReactiveFallback>
+          <AvoidObstacle sticky_time="1.0"/>
+          <SubTree ID="PassGateFinalsProcedure"/>
+        </ReactiveFallback>
+
+        <!-- 撞柱刻意「沒有」入口守衛。這段是逐根計分的（每根 20 分獨立入袋，
+             撞不到還有 SkipFlare 接住），所以做到哪算哪 —— 剩 250 秒衝進去
+             撞到一根就是 20 分，而省下這 250 秒的時間獎勵只值 7.5 分
+             （匯率 0.03 分/秒）。任何一根柱子的期望值都遠大於整段的時間成本，
+             擋在門口只會虧。收尾交給外層的硬性截止，不會因此上不了浮。 -->
+        <!-- 撞柱深度 0.9 m。這一行原本不存在，撞柱是沿用上一行過門的 0.7 m
+             —— 而 0.7 是為了鑽過「1 m 高、坐在池底」的閘門定的，跟撞柱要的深度
+             是兩件事。
+
+             幾何（池深 1.60 m，現場實測；模擬池底 z=−1.6 相同）。數字取自
+             model.sdf 的 collision，不是規則書的概數：
+               · flare：pole collision 佔池底上方 0.018~0.863 m，頂端高爾夫球到
+                 0.873 m → 柱身佔水深 0.74~1.58 m
+               · 艇體：原點上緣 +0.230 / 下緣 −0.140，所以指令深度 d 時艇身佔
+                 水深 d−0.230 ~ d+0.140。
+                 上緣取自 main_hull_visual（r=0.115 的圓柱，中心 z=0.115 → 頂
+                 0.230），**不是** main_body_buoyancy 那個 collision box 的
+                 0.215 —— 那個 box 的下緣停在 +0.015，等於完全不含下方框架，
+                 兩端都不能拿來當實體外形。下緣取自 main_frame_visual
+                 （中心 −0.070、厚 0.140 → 底 −0.140）。
+
+             早前用的是 d = 1.15，由「艇身上緣要在柱頂之下（d ≥ 0.97）」與「下緣
+             離池底留餘裕（d ≤ 1.21）」夾出來，留了 0.18 m 的深度控制誤差餘裕。
+
+             現在改成 d = 0.9，**低於**那個 0.97 下限：艇身佔水深 0.67~1.04，與柱身
+             0.74~1.58 的重疊只剩 0.30 m（1.15 時是 0.37 m），且艇身上緣（0.67）已經
+             比柱頂（0.74）淺 0.07 m —— 也就是穩態零誤差時上緣就已經探出柱頂之上，
+             深度控制若再偏淺會直接從柱頂掠過而非仍有餘裕。這是刻意換來的：0.9 離池
+             底更遠（下緣離池底 0.56 m，遠大於 1.15 時的 0.31 m），也更貼近 PassGate
+             的 0.7 m，下潛行程從 0.45 m 縮到 0.2 m。是否要補這 0.07 m 負餘裕，等實測
+             結果出來再決定。
+
+             前視相機在原點上方 0.115 m，即水深 0.785 m；柱頂在 0.74 m，僅高出光軸
+             0.045 m（1.15 時是 0.30 m）。VFOV 由 HFOV 1.211 rad 與 640×480 推得約
+             55 度（±27.4），1 m 外柱頂仰角 2.6 度，仍在畫面內，且比舊值更靠近畫面
+             中心。
+
+             ⚠ SetDepth 是 SyncActionNode，發完立刻 SUCCESS，不等艇真的到位。
+                從 0.7 下潛到 0.9 的 20 cm 期間 SearchTarget 已經在轉了。轉圈與
+                下潛可以並行所以不致命，但這是 P2-12（缺 WaitForDepth）的一個
+                實例，別誤以為進 CommunicationTask 時深度已經穩定。
+
+             zone="flare" 讓這裡改成由現場池深換算：pool_depth_flare_m 減
+             zone_offset_flare_m（預設 0.70，讓 H=1.60 時算出跟這裡原本一樣的
+             0.9）。上面整段推導假設的池深 1.60 m 就是 pool_depth_flare_m 的
+             預設值 —— 現場池深不是 1.60 時，這段推導的數字要跟著重算，不會
+             自動更新。 -->
+        <SetDepth zone="flare"/>
+        <SubTree ID="CommunicationTask"/>
+
+        <!-- 撿球：finals.onnx（7 類）目前沒有 ball 類，這段實際上不可能成功，
+             留著是為了模型重訓加上 ball 之後能直接接回來。時間守衛讓它在
+             「跑得完才跑」，跑不完就跳過去上浮。
+
+             跟上面 TargetAcquisition 前用的是同一個 zone="drop"（放球和撿球
+             要停的深度相同，都是 0.30）。 -->
+        <SetDepth zone="drop"/>
+        <Fallback>
+          <Sequence>
+            <MissionTimeLeft seconds="240"/>
+            <SubTree ID="TargetReacquisition" drop_pose="{drop_pose}"/>
+          </Sequence>
+          <AlwaysSuccess/>
+        </Fallback>
+
+        <FinishMission/>
+      </Sequence>
+
+    </ReactiveFallback>
   </BehaviorTree>
 
   <BehaviorTree ID="TargetAcquisition">
     <Sequence>
       <SetCamera mode="realsense"/>
-      <RetryUntilSuccessful num_attempts="60">
+      <!-- P0-3：同 PassGateFinalsProcedure。num_attempts 從 60 降到 6，是因為
+           加上 Timeout 之後這個數字才第一次真的生效 —— 6 × (30 s 搜 + 60 s 接近)
+           已經是 9 分鐘，60 次會把整場 900 秒燒光。 -->
+      <RetryUntilSuccessful num_attempts="6">
         <Sequence>
-          <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+          <Timeout msec="30000">
+            <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+          </Timeout>
           <Timeout msec="60000">
             <ApproachTarget label="blue_drum" distance="4.0"/>
           </Timeout>
@@ -109,71 +412,116 @@
     </Sequence>
   </BehaviorTree>
 
+  <!-- sweep_direction="-1"：三根柱子的搜尋一律先往逆時鐘轉。
+       第二次過門之後艇是朝著出發牆的方向、柱子在池子偏某一側，順時鐘起手會
+       先掃過空水域，浪費 60 s Timeout 的前半段。方向只決定「起手往哪轉」——
+       一旦看到目標，sweep_direction_ 就改由目標在畫面左右接手，跟丟後仍會往
+       剛才看到的那一側回轉。
+       符號約定看 search_target.cpp 的對準環：目標在畫面右邊時 cmd.yaw 為正，
+       所以正 = 順時鐘（右轉），負 = 逆時鐘。
+
+       num_attempts="3"（原本 6）：單根柱子最壞是 6 × (60 s 搜 + 45 s 接近) =
+       630 s，三根 1890 s，遠超 900 s 的總預算。實際跑起來的後果不是「三根都
+       試得比較久」，而是第一根把時間吃光、後兩根一次都沒試到。每根 20 分是
+       獨立入袋的，讓三根都有機會的期望值遠高於在第一根上重試六次。
+
+       min_height_px="220"：深度失效時的備援到位判準，只有 flare 用得到。
+       ApproachTarget 的 SUCCESS 原本只有一個出口，而且要求 distance > 0；深度
+       估不出來時 blind 分支「只能失敗」，盲衝 30 秒後回 FAILURE。而 1.6 cm 的
+       桿子正是立體深度最估不出來的東西，等於三根柱子必然全數 SkipFlare。
+
+       220 是這樣來的：水平焦距 (640/2)/tan(1.211/2) = 462 px（同一個數推出既有
+       的 gate_posts_success_gap_px=230），柱高含頂球 0.87 m。encoder 是否把
+       480 縱向拉成 640 沒有從程式碼確認，所以兩種假設都算：
+         f_v=462（不拉伸）→ 220 px 對應 1.83 m
+         f_v=616（拉伸）  → 220 px 對應 2.44 m
+       BumpFlare 5 秒在 surge 25 下推進 2.82 m（mass 21、xU −30、xUabsU −1 的
+       數值積分），兩種假設都涵蓋得到，所以先取 220 是安全的。
+
+       ⚠ 這個值要用模擬校正：blind 分支每個 tick 都會把 h=<框高> 寫進
+         debug_msg，跑一次就能看到柱子在各距離的實際框高，再回頭修這個數字。 -->
   <BehaviorTree ID="CommunicationTask">
     <Sequence>
       <WaitForFlareOrder/>
 
       <Fallback>
         <Sequence>
-          <RetryUntilSuccessful num_attempts="6">
+          <RetryUntilSuccessful num_attempts="3">
             <Sequence>
               <Timeout msec="60000">
-                <SearchTarget label="{flare_1}" yaw_speed="0.45"/>
+                <SearchTarget label="{flare_1}" yaw_speed="0.45" sweep_direction="-1"/>
               </Timeout>
               <Timeout msec="45000">
-                <ApproachTarget label="{flare_1}" distance="1.0"/>
+                <ApproachTarget label="{flare_1}" distance="1.0" min_height_px="220"/>
               </Timeout>
               <FinalAlignTarget label="{flare_1}"/>
             </Sequence>
           </RetryUntilSuccessful>
-          <BumpFlare timeout="15.0"/>
+          <!-- 5.0 秒。surge 25 對 mass 21 / xU −30 / xUabsU −1 做數值積分，
+               5 秒推進 2.82 m —— 從 ApproachTarget 的停止距離（深度有效時 1.0 m，
+               走視覺備援時約 1.8~2.4 m）撞得到，又不會像原本的 15 秒那樣衝出
+               9.35 m 去撞對面池壁（碰壁 −5/次，5 次自動 abort）。
+               BumpFlare 沒有任何命中判定，這個時長就是唯一限制行程的東西。 -->
+          <BumpFlare timeout="5.0"/>
         </Sequence>
         <SkipFlare/>
       </Fallback>
 
       <Fallback>
         <Sequence>
-          <RetryUntilSuccessful num_attempts="6">
+          <RetryUntilSuccessful num_attempts="3">
             <Sequence>
               <Timeout msec="60000">
-                <SearchTarget label="{flare_2}" yaw_speed="0.45"/>
+                <SearchTarget label="{flare_2}" yaw_speed="0.45" sweep_direction="-1"/>
               </Timeout>
               <Timeout msec="45000">
-                <ApproachTarget label="{flare_2}" distance="1.0"/>
+                <ApproachTarget label="{flare_2}" distance="1.0" min_height_px="220"/>
               </Timeout>
               <FinalAlignTarget label="{flare_2}"/>
             </Sequence>
           </RetryUntilSuccessful>
-          <BumpFlare timeout="15.0"/>
+          <!-- 5.0 秒。surge 25 對 mass 21 / xU −30 / xUabsU −1 做數值積分，
+               5 秒推進 2.82 m —— 從 ApproachTarget 的停止距離（深度有效時 1.0 m，
+               走視覺備援時約 1.8~2.4 m）撞得到，又不會像原本的 15 秒那樣衝出
+               9.35 m 去撞對面池壁（碰壁 −5/次，5 次自動 abort）。
+               BumpFlare 沒有任何命中判定，這個時長就是唯一限制行程的東西。 -->
+          <BumpFlare timeout="5.0"/>
         </Sequence>
         <SkipFlare/>
       </Fallback>
 
       <Fallback>
         <Sequence>
-          <RetryUntilSuccessful num_attempts="6">
+          <RetryUntilSuccessful num_attempts="3">
             <Sequence>
               <Timeout msec="60000">
-                <SearchTarget label="{flare_3}" yaw_speed="0.45"/>
+                <SearchTarget label="{flare_3}" yaw_speed="0.45" sweep_direction="-1"/>
               </Timeout>
               <Timeout msec="45000">
-                <ApproachTarget label="{flare_3}" distance="1.0"/>
+                <ApproachTarget label="{flare_3}" distance="1.0" min_height_px="220"/>
               </Timeout>
               <FinalAlignTarget label="{flare_3}"/>
             </Sequence>
           </RetryUntilSuccessful>
-          <BumpFlare timeout="15.0"/>
+          <!-- 5.0 秒。surge 25 對 mass 21 / xU −30 / xUabsU −1 做數值積分，
+               5 秒推進 2.82 m —— 從 ApproachTarget 的停止距離（深度有效時 1.0 m，
+               走視覺備援時約 1.8~2.4 m）撞得到，又不會像原本的 15 秒那樣衝出
+               9.35 m 去撞對面池壁（碰壁 −5/次，5 次自動 abort）。
+               BumpFlare 沒有任何命中判定，這個時長就是唯一限制行程的東西。 -->
+          <BumpFlare timeout="5.0"/>
         </Sequence>
         <SkipFlare/>
       </Fallback>
     </Sequence>
   </BehaviorTree>
 
-  <!-- 撞柱專用單獨測試樹：自動下潛至 0.7m、啟用前視相機並執行撞柱 -->
+  <!-- 撞柱專用單獨測試樹：自動下潛至撞柱深度、啟用前視相機並執行撞柱 -->
   <BehaviorTree ID="OnlyCommunicationTask">
     <Sequence>
       <SetCamera mode="realsense"/>
-      <SetDepth depth="0.7"/>
+      <!-- 撞柱深度要跟 FinalMission 的呼叫端一致（都用 zone="flare"），否則單段
+           測出來的結果搬不到全流程上。幾何推導寫在 FinalMission 那一處。 -->
+      <SetDepth zone="flare"/>
       <SubTree ID="CommunicationTask"/>
       <SetDepth depth="0.0"/>
     </Sequence>
@@ -182,22 +530,56 @@
   <BehaviorTree ID="TargetReacquisition">
     <Sequence>
       <SetCamera mode="realsense"/>
-      <GoToPose pose_key="drop_pose"/>
-      <SetCamera mode="usb"/>
-      <RetryUntilSuccessful num_attempts="100">
-        <Fallback>
-          <Sequence>
-            <SearchBottomTarget label="ball"/>
-            <MoveAboveTarget label="ball"/>
-            <ExtendArm/>
-            <GrabBall/>
-            <RetractArm/>
-          </Sequence>
-          <ForceFailure>
-            <SpiralSearchBottom/>
-          </ForceFailure>
-        </Fallback>
+
+      <!-- 折返：直接用視覺找藍桶，不再靠 GoToPose 的 dead reckoning 座標。
+           world_model 的位置是純 IMU 開迴路二次積分，沒有任何絕對位置修正，
+           跨整個場地折返的誤差遠大於 go_to_pose_threshold（1.0 m），所以
+           「回到 drop_pose」實際上是回到一個累積誤差之後的點。
+
+           藍桶在場上是唯一的（四個桶只有一個藍），finals.onnx 也有
+           blue_drum 這一類 —— 它本身就是一個可觀測的絕對定位參考，比推算
+           出來的座標可靠。這一段與 TargetAcquisition 的取得段完全相同，
+           是刻意的：同一個目標、同一組節點、同一組參數。
+
+           SearchTarget 找不到目標時永遠回傳 RUNNING 不會失敗，所以一定要
+           包 Timeout，否則 RetryUntilSuccessful 收不到 FAILURE、整個折返會
+           原地旋轉到比賽結束。 -->
+      <RetryUntilSuccessful num_attempts="4">
+        <Sequence>
+          <Timeout msec="45000">
+            <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+          </Timeout>
+          <Timeout msec="60000">
+            <ApproachTarget label="blue_drum" distance="4.0"/>
+          </Timeout>
+          <FinalAlignTarget label="blue_drum"/>
+        </Sequence>
       </RetryUntilSuccessful>
+
+      <SetCamera mode="usb"/>
+      <!-- 找球整段限 60 秒。裡層的 num_attempts="100" 原本最壞是
+           100 × (30 s 搜 + 45 s 螺旋) = 7500 秒；包上 Timeout 之後那個數字
+           就不再有意義，實際上限由這裡決定。逾時回 FAILURE，FinalMission
+           那邊的 Fallback + AlwaysSuccess 會接住，流程繼續往下上浮。
+           注意 Timeout 到期會直接 halt 子節點，所以萬一在第 59 秒才抓到球，
+           伸手／抓／收會被中斷 —— 等 ball 類練進模型、確認實際耗時之後再
+           把這個值放寬。 -->
+      <Timeout msec="60000">
+        <RetryUntilSuccessful num_attempts="100">
+          <Fallback>
+            <Sequence>
+              <SearchBottomTarget label="ball"/>
+              <MoveAboveTarget label="ball"/>
+              <ExtendArm/>
+              <GrabBall/>
+              <RetractArm/>
+            </Sequence>
+            <ForceFailure>
+              <SpiralSearchBottom/>
+            </ForceFailure>
+          </Fallback>
+        </RetryUntilSuccessful>
+      </Timeout>
     </Sequence>
   </BehaviorTree>
 

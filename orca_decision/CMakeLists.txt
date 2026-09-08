@@ -52,6 +52,8 @@ set(SOURCES
   src/behavior_tree_nodes/retract_arm.cpp
   src/behavior_tree_nodes/wait_for_start.cpp
   src/behavior_tree_nodes/finish_mission.cpp
+  src/behavior_tree_nodes/gate_by_posts.cpp
+  src/behavior_tree_nodes/mission_time_left.cpp
 )
 
 add_executable(decision_node ${SOURCES})

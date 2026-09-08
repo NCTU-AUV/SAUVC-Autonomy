@@ -303,6 +303,57 @@ private:
 };
 
 // ============================================================
+// New BT Nodes — Qualification: gate inferred from a post pair
+// ============================================================
+//
+// These three mirror SearchTarget / ApproachTarget / FinalAlignTarget one for
+// one, but steer on the midpoint of two post-shaped detections instead of on a
+// single box centre. Use them when the gate's top bar is too close to the
+// surface to survive detection; use the originals when the whole gate is
+// reliably boxed. Nothing here touches the original three.
+
+class SearchGateByPosts : public BT::ActionNodeBase {
+public:
+    SearchGateByPosts(const std::string& name, const BT::NodeConfiguration& config);
+    static BT::PortsList providedPorts();
+    BT::NodeStatus tick() override;
+    void halt() override;
+    void setContext(std::shared_ptr<DecisionContext> ctx) { ctx_ = ctx; }
+private:
+    std::shared_ptr<DecisionContext> ctx_;
+    int stable_frames_ = 0;
+    int sweep_direction_ = 1;
+};
+
+class ApproachGateByPosts : public BT::ActionNodeBase {
+public:
+    ApproachGateByPosts(const std::string& name, const BT::NodeConfiguration& config);
+    static BT::PortsList providedPorts();
+    BT::NodeStatus tick() override;
+    void halt() override;
+    void setContext(std::shared_ptr<DecisionContext> ctx) { ctx_ = ctx; }
+private:
+    std::shared_ptr<DecisionContext> ctx_;
+    int stable_frames_ = 0;
+    int lost_frames_ = 0;
+    int blind_frames_ = 0;
+};
+
+class AlignGateByPosts : public BT::ActionNodeBase {
+public:
+    AlignGateByPosts(const std::string& name, const BT::NodeConfiguration& config);
+    static BT::PortsList providedPorts();
+    BT::NodeStatus tick() override;
+    void halt() override;
+    void setContext(std::shared_ptr<DecisionContext> ctx) { ctx_ = ctx; }
+private:
+    std::shared_ptr<DecisionContext> ctx_;
+    rclcpp::Time align_start_time_;
+    bool aligning_ = false;
+    int lost_frames_ = 0;
+};
+
+// ============================================================
 // New BT Nodes — Mission Control
 // ============================================================
 
@@ -312,6 +363,22 @@ public:
     static BT::PortsList providedPorts();
     BT::NodeStatus tick() override;
     void halt() override;
+    void setContext(std::shared_ptr<DecisionContext> ctx) { ctx_ = ctx; }
+private:
+    std::shared_ptr<DecisionContext> ctx_;
+};
+
+// 全域時間預算守衛。ConditionNode，無副作用、不控制推進器，可以放在
+// ReactiveFallback 底下每個 tick 重評而不會干擾任何動作節點。
+//
+// 兩種用法：
+//   直接用   —— 「時間夠才進入這段可選任務」
+//   包 Inverter —— 「時間不夠時觸發」，用來做截止上浮
+class MissionTimeLeft : public BT::ConditionNode {
+public:
+    MissionTimeLeft(const std::string& name, const BT::NodeConfiguration& config);
+    static BT::PortsList providedPorts();
+    BT::NodeStatus tick() override;
     void setContext(std::shared_ptr<DecisionContext> ctx) { ctx_ = ctx; }
 private:
     std::shared_ptr<DecisionContext> ctx_;

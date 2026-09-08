@@ -100,6 +100,10 @@ void DecisionNode::loadParameters() {
   this->declare_parameter("tree_xml_file", "config/trees.xml");
   this->declare_parameter("main_tree_id", "FinalMission");
 
+  // 全域時間預算（秒）。規則書的 15 分鐘含所有 retry，MissionTimeLeft 用它
+  // 換算剩餘時間。做成參數而不是寫死 900，是為了能用短預算測截止行為。
+  this->declare_parameter("mission_budget_sec", 900.0);
+
   this->declare_parameter("camera_switch_hysteresis", 0.5);
   this->declare_parameter("align_yaw_threshold", 0.1);
   this->declare_parameter("align_distance_threshold", 0.5);
@@ -155,6 +159,30 @@ void DecisionNode::loadParameters() {
   // SpiralSearch parameters
   this->declare_parameter("spiral_search_timeout_sec", 45.0);
 
+  // Gate-from-post-pair parameters (SearchGateByPosts / ApproachGateByPosts /
+  // AlignGateByPosts). These only shape which detections get read as a pair of
+  // gate posts; nothing here affects the whole-gate nodes.
+  //
+  // A q_gate post is a 1.6 m cylinder of radius 2 cm, so a correctly boxed post
+  // is far taller than it is wide, while a whole gate including its top bar is
+  // wider than tall — 1.8 separates the two cases with room to spare for a
+  // partially truncated post.
+  this->declare_parameter("gate_post_min_aspect_ratio", 1.8);
+  this->declare_parameter("gate_post_min_gap_px", 40.0);
+  this->declare_parameter("gate_post_max_gap_px", 520.0);
+  this->declare_parameter("gate_post_max_height_ratio", 1.8);
+
+  // Post separation that stands in for a depth reading when depth_perception's
+  // gate estimator rejects the narrow post boxes and reports -1.
+  //
+  // Derivation: the gate opening is 1.5 m (posts at +/-0.75 in q_gate). At the
+  // RealSense colour HFOV of ~69.4 deg the 640-wide tensor has a focal length
+  // of 320/tan(34.7 deg) ~= 462 px, so a 1.5 m opening at 3 m subtends
+  // 1.5*462/3 ~= 230 px. That makes 230 the gap-space equivalent of the
+  // distance="3.0" the tree asks for. Re-derive this if the gate distance in
+  // the tree changes; the two should move together.
+  this->declare_parameter("gate_posts_success_gap_px", 230.0);
+
   // Actuator timing
   this->declare_parameter("drop_ball_wait_sec", 0.5);
   this->declare_parameter("actuator_wait_sec", 1.0);
@@ -195,6 +223,55 @@ void DecisionNode::loadParameters() {
       this->get_parameter("align_yaw_threshold").as_double();
   ctx_->align_distance_threshold =
       this->get_parameter("align_distance_threshold").as_double();
+
+  // 決賽現場池深校正。資格賽三棵樹的 SetDepth 一律用 depth= 字面值，完全不
+  // 讀這幾個參數 —— 只有 zone= port（目前只有 FinalMission /
+  // OnlyCommunicationTask 用）會查。預設值讓換算結果等於決賽 trees.xml 裡原本
+  // 硬寫的深度，所以網頁沒接上或忘了改，行為跟改動前一致。推導見
+  // decision_context.hpp 的欄位註解與 decision_params.yaml。
+  this->declare_parameter("pool_depth_gate_m", 1.60);
+  this->declare_parameter("pool_depth_drop_m", 1.20);
+  this->declare_parameter("pool_depth_flare_m", 1.60);
+  this->declare_parameter("zone_offset_gate_m", 0.90);
+  this->declare_parameter("zone_offset_drop_m", 0.90);
+  this->declare_parameter("zone_offset_flare_m", 0.70);
+
+  ctx_->pool_depth_gate_m = this->get_parameter("pool_depth_gate_m").as_double();
+  ctx_->pool_depth_drop_m = this->get_parameter("pool_depth_drop_m").as_double();
+  ctx_->pool_depth_flare_m = this->get_parameter("pool_depth_flare_m").as_double();
+  ctx_->zone_offset_gate_m = this->get_parameter("zone_offset_gate_m").as_double();
+  ctx_->zone_offset_drop_m = this->get_parameter("zone_offset_drop_m").as_double();
+  ctx_->zone_offset_flare_m = this->get_parameter("zone_offset_flare_m").as_double();
+}
+
+bool ZoneTargetDepth(const DecisionContext& ctx, const std::string& zone,
+                      float* out_depth) {
+  if (!out_depth) {
+    return false;
+  }
+  float pool_depth;
+  float offset;
+  if (zone == "gate") {
+    pool_depth = ctx.pool_depth_gate_m;
+    offset = ctx.zone_offset_gate_m;
+  } else if (zone == "drop") {
+    pool_depth = ctx.pool_depth_drop_m;
+    offset = ctx.zone_offset_drop_m;
+  } else if (zone == "flare") {
+    pool_depth = ctx.pool_depth_flare_m;
+    offset = ctx.zone_offset_flare_m;
+  } else {
+    return false;
+  }
+
+  const float upper_bound = pool_depth - ctx.hull_bottom_margin;
+  const float raw = pool_depth - offset;
+  // upper_bound can fall below min_depth for an unrealistically shallow pool
+  // input; clamping the bound itself keeps the result sane (equal to
+  // min_depth) instead of producing lower > upper and an inverted clamp.
+  const float lower_bound = std::min(ctx.min_depth, upper_bound);
+  *out_depth = std::clamp(raw, lower_bound, upper_bound);
+  return true;
 }
 
 void DecisionNode::setupInterfaces() {
@@ -247,6 +324,77 @@ void DecisionNode::setupInterfaces() {
   ctx_->desired_depth_pub = desired_depth_pub_;
   ctx_->arm_pub = arm_pub_;
   ctx_->hand_pub = hand_pub_;
+
+  // 讓 GUI 用 set_parameters 即時改現場池深。只認 loadParameters() 宣告過的
+  // 六個池深/offset 名字，其他參數（PID 增益等）一律放行，不在這裡處理。
+  //
+  // 「即時」是刻意做到的：SetDepth 是 SyncActionNode，發一次就返回，任務跑到
+  // 一半改池深不會讓已經 tick 過的那次重發。所以池深一變，只要目前深度是由
+  // 某個 zone 算出來的（ctx_->current_depth_zone 非空），就在這裡直接重算、
+  // 重發 desired_depth_pub_，不等下一次 SetDepth tick。current_depth_zone 是
+  // 唯一的判準：資格賽的 SetDepth 全部走 depth= 字面值，永遠不會設這個欄位，
+  // 所以資格賽任務進行中即使有人手滑改了這幾個參數，也不會有任何深度指令被
+  // 這個回呼重發。
+  pool_depth_param_cb_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&DecisionNode::onPoolDepthParametersSet, this,
+                std::placeholders::_1));
+}
+
+rcl_interfaces::msg::SetParametersResult DecisionNode::onPoolDepthParametersSet(
+    const std::vector<rclcpp::Parameter> &params) {
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  for (const auto &param : params) {
+    const std::string &name = param.get_name();
+    const bool is_pool_depth_param =
+        name == "pool_depth_gate_m" || name == "pool_depth_drop_m" ||
+        name == "pool_depth_flare_m" || name == "zone_offset_gate_m" ||
+        name == "zone_offset_drop_m" || name == "zone_offset_flare_m";
+    if (!is_pool_depth_param) {
+      continue;
+    }
+    if (param.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      result.successful = false;
+      result.reason = name + " must be a double";
+      return result;
+    }
+    const double value = param.as_double();
+    if (!std::isfinite(value) || value <= 0.0) {
+      result.successful = false;
+      result.reason = name + " must be a positive, finite number";
+      return result;
+    }
+
+    if (name == "pool_depth_gate_m") {
+      ctx_->pool_depth_gate_m = value;
+    } else if (name == "pool_depth_drop_m") {
+      ctx_->pool_depth_drop_m = value;
+    } else if (name == "pool_depth_flare_m") {
+      ctx_->pool_depth_flare_m = value;
+    } else if (name == "zone_offset_gate_m") {
+      ctx_->zone_offset_gate_m = value;
+    } else if (name == "zone_offset_drop_m") {
+      ctx_->zone_offset_drop_m = value;
+    } else if (name == "zone_offset_flare_m") {
+      ctx_->zone_offset_flare_m = value;
+    }
+  }
+
+  if (ctx_->mission_started && !ctx_->current_depth_zone.empty()) {
+    float depth;
+    if (ZoneTargetDepth(*ctx_, ctx_->current_depth_zone, &depth) &&
+        ctx_->desired_depth_pub) {
+      std_msgs::msg::Float64 msg;
+      msg.data = depth;
+      ctx_->desired_depth_pub->publish(msg);
+      RCLCPP_INFO(this->get_logger(),
+                  "Pool depth updated: re-published zone '%s' -> %.2f m",
+                  ctx_->current_depth_zone.c_str(), depth);
+    }
+  }
+
+  return result;
 }
 
 void DecisionNode::registerBehaviorTree() {
@@ -390,8 +538,30 @@ void DecisionNode::publishStatusJson() {
        << ",\"is_recovering\":" << jsonBool(status.is_recovering)
        << ",\"mission_time\":" << jsonNumber(status.mission_time, 1)
        << ",\"camera_mode\":\"" << jsonEscape(status.camera_mode) << "\""
-       << ",\"debug\":\"" << jsonEscape(status.debug) << "\""
-       << "}";
+       << ",\"debug\":\"" << jsonEscape(status.debug) << "\"";
+
+  // 決賽現場池深校正的回讀通路：操作員在網頁輸入池深後，這裡把換算結果送
+  // 回去顯示，按 Start 前能看到「1.60 → gate 0.70」這種對照，而不是只能相信
+  // 自己按對了數字。depth_zone 是空字串代表目前深度不是由某個 zone 換算出來
+  // 的（資格賽全程、或決賽尚未進入任何 zone）。
+  {
+    float gate_depth = 0.0f, drop_depth = 0.0f, flare_depth = 0.0f;
+    ZoneTargetDepth(*ctx_, "gate", &gate_depth);
+    ZoneTargetDepth(*ctx_, "drop", &drop_depth);
+    ZoneTargetDepth(*ctx_, "flare", &flare_depth);
+
+    json << ",\"depth_zone\":\"" << jsonEscape(ctx_->current_depth_zone) << "\""
+         << ",\"pool_depths\":{"
+         << "\"gate\":" << jsonNumber(ctx_->pool_depth_gate_m)
+         << ",\"drop\":" << jsonNumber(ctx_->pool_depth_drop_m)
+         << ",\"flare\":" << jsonNumber(ctx_->pool_depth_flare_m) << "}"
+         << ",\"zone_depths\":{"
+         << "\"gate\":" << jsonNumber(gate_depth)
+         << ",\"drop\":" << jsonNumber(drop_depth)
+         << ",\"flare\":" << jsonNumber(flare_depth) << "}";
+  }
+
+  json << "}";
 
   std_msgs::msg::String msg;
   msg.data = json.str();

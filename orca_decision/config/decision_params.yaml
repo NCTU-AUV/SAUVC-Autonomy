@@ -15,6 +15,10 @@ decision_node:
     tree_xml_file: "config/trees.xml"
     main_tree_id: "FinalMission"
 
+    # 全域時間預算（秒）—— 規則書的 15 分鐘含所有 retry。
+    # MissionTimeLeft 拿它減掉 mission_start_time 起算的經過時間。
+    mission_budget_sec: 900.0
+
     # /orca/decision/status_json 的發布頻率（Hz）。這是 DecisionStatus 的 JSON
     # 鏡像，給 control 容器的 Web GUI 用 —— 那邊沒有 orca_interface，反序列化
     # 不了原本的訊息。從 50 Hz 的 wrench loop 抽取，設 0 可完全關掉。
@@ -87,6 +91,49 @@ decision_node:
     # SpiralSearch
     spiral_search_timeout_sec: 45.0
 
+    # 由「兩根柱子」推得閘門的節點群（SearchGateByPosts / ApproachGateByPosts /
+    # AlignGateByPosts）。這幾個值只決定哪些偵測框會被讀成一對閘門立柱，完全
+    # 不影響原本以整個 gate 框運作的節點。
+    gate_post_min_aspect_ratio: 1.8   # height/width 超過此值才算「柱子」
+    gate_post_min_gap_px:       40.0  # 兩柱像素間距下限（太近不可能是開口）
+    gate_post_max_gap_px:       520.0 # 上限（太遠通常是分屬兩座閘門的柱子）
+    gate_post_max_height_ratio: 1.8   # 高/矮框高度比上限（同一座門的兩柱高度相近）
+
+    # 深度失效時取代距離判斷的柱間距。閘門開口 1.5 m，RealSense 彩色 HFOV
+    # 約 69.4 度 → 640 張量的焦距約 462 px，故 3 m 處開口約 230 px。這是
+    # 樹裡 distance="3.0" 在像素空間的等價值，改一個就要一起改。
+    gate_posts_success_gap_px:  230.0
+
     # Actuator timing
     drop_ball_wait_sec: 0.5
     actuator_wait_sec: 1.0
+
+    # 決賽現場池深校正。資格賽的 SetDepth 全部用 depth= 字面值，完全不讀這幾個
+    # 參數，改這裡不會動到資格賽任何一棵樹（trees.xml 裡只有 FinalMission 和
+    # OnlyCommunicationTask 用 zone= 讀它們）。
+    #
+    # 操作員在網頁上量測並輸入 pool_depth_*_m（三個輸入格：gate / drop /
+    # flare）；zone_offset_*_m 是各深度目標距水面的固定幾何常數，池子不變就
+    # 不用動。換算式（decision_node.cpp 的 ZoneTargetDepth）：
+    #   d = clamp(pool_depth − zone_offset, min_depth, pool_depth − hull_bottom_margin)
+    # min_depth（0.35，破水面保險）與 hull_bottom_margin（0.34，離池底餘裕）
+    # 寫死在 decision_context.hpp，不開放成參數。
+    #
+    # 下面的預設值是刻意選的：套用預設值算出來的深度，跟 trees.xml 這次改動
+    # 之前硬寫的決賽深度完全相同 —— 網頁沒接上、或現場忘了輸入池深，決賽行為
+    # 跟改動前一致。
+    #   zone="gate"（過門，兩次）        pool=1.60, offset=0.90 → 0.70
+    #   zone="drop"（放球前、撿球前，兩次） pool=1.20, offset=0.90 → 0.30
+    #   zone="flare"（撞柱，兩次）       pool=1.60, offset=0.70 → 0.90
+    #
+    # ⚠ zone="drop" 算出的 0.30 低於 set_depth.cpp 的 kMinDepth（0.35，破水面
+    # 保險）—— SetDepth 會把它頂到 0.35 才真正發布。這不是這次改動造成的：
+    # trees.xml 原本硬寫的 depth="0.30" 一直都被同一條 clamp 頂到 0.35，行為
+    # 跟改動前完全一致，只是「這裡填的常數」和「艇真正下潛到的深度」本來就不
+    # 是同一個數字。
+    pool_depth_gate_m: 1.60
+    pool_depth_drop_m: 1.20
+    pool_depth_flare_m: 1.60
+    zone_offset_gate_m: 0.90
+    zone_offset_drop_m: 0.90
+    zone_offset_flare_m: 0.70
