@@ -67,6 +67,7 @@ build)
         "${ROOT}/build_image_layers.sh" \
             --image_key "aarch64.${IMAGE_KEY}" \
             --image_name "${LOCAL_IMAGE}" \
+            --build_arg "PLATFORM=arm64" \
             --docker_arg "--platform=linux/arm64"
     else
         echo "==> 建置本機架構映像：${LOCAL_IMAGE}"
