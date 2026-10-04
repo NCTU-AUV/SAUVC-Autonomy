@@ -51,8 +51,21 @@
            initialized」（2026-10-02 以最小測試樹逐一驗證過）。
            呼叫端忘了設這兩個 key 時，SearchTarget 會印 ERROR 並退回原地轉圈。
            advance_surge 12：介於 ApproachTarget 的盲推 8 與上限 20 之間。
-           預算是秒數不是距離，換算見 FinalMission 呼叫端。 -->
+           預算是秒數不是距離，換算見 FinalMission 呼叫端。
+
+           gate_acquired：找門段結束（成功或 90 s 逾時都算）就設 true。外層
+           ReactiveFallback 的 AvoidObstacle 一觸發會 halt 整棵子樹，Sequence
+           回到第 0 個子節點 —— 沒有這個旗標的話，盲走途中避障一次就會回頭
+           重新找門（seed 2 校正跑：門已經在身後，又找了 58 秒）。加上前進掃描
+           後這更危險：去程中心 0° 會朝對面池壁推進去找一個在背後的門。
+           有了旗標，重新進來直接跳到 BlindForward，它本來就跨 halt 累計已走
+           時間、保留鎖定航向，等於從中斷處接著走。呼叫端每次進來前要把它
+           設回 false。 -->
       <Fallback>
+        <BlackboardCheckString value_A="{gate_acquired}" value_B="true"
+                               return_on_mismatch="FAILURE">
+          <AlwaysSuccess/>
+        </BlackboardCheckString>
         <Timeout msec="90000">
           <RetryUntilSuccessful num_attempts="6">
             <Sequence>
@@ -70,6 +83,7 @@
         </Timeout>
         <AlwaysSuccess/>
       </Fallback>
+      <SetBlackboard output_key="gate_acquired" value="true"/>
       <!-- 決賽專用時長：16.0 秒 -->
       <BlindForward duration="16.0" heading_lock="true"/>
     </Sequence>
@@ -293,6 +307,7 @@
              8 m 留了足夠餘裕，不會在沒看到門的情況下衝過門線。
              途經橘 flare 區，由外層 AvoidObstacle 擋。 -->
         <SetBlackboard output_key="gate_heading_deg" value="0"/>
+        <SetBlackboard output_key="gate_acquired" value="false"/>
         <SetBlackboard output_key="gate_budget_sec" value="47"/>
         <ReactiveFallback>
           <AvoidObstacle sticky_time="1.0"/>
@@ -339,6 +354,7 @@
              進到柱外與橘 flare 區，所以刻意比去程小很多。
              若艇一進來就背對門，會先「回正」到 180° 扇區，回正期間不前進。 -->
         <SetBlackboard output_key="gate_heading_deg" value="180"/>
+        <SetBlackboard output_key="gate_acquired" value="false"/>
         <SetBlackboard output_key="gate_budget_sec" value="18"/>
         <ReactiveFallback>
           <AvoidObstacle sticky_time="1.0"/>
