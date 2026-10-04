@@ -29,6 +29,23 @@ private:
     // 更新，所以「跟丟後往剛才看到的方向回轉」的行為不受影響。
     int sweep_direction_ = 1;
     bool sweep_direction_initialised_ = false;
+
+    // 前進掃描（heading_deg 有設時才啟用，見 search_target.cpp）。
+    // 已推進秒數跨 halt 與外層 Retry 累計，不歸零 —— 否則 RetryUntilSuccessful
+    // 重試幾次就等於前進幾倍距離。只有任務重新開始（mission_start_time 變了）
+    // 才歸零。
+    double advance_used_sec_ = 0.0;
+    int64_t advance_mission_stamp_ns_ = -1;
+    // 上一次 tick 的時間，用來算 dt。halt 時清掉，避免把中間別的節點在跑的
+    // 時間算成推進時間。
+    bool have_last_tick_ = false;
+    rclcpp::Time last_tick_time_;
+    // 這次進入節點的時間，settle_sec 從這裡起算。
+    rclcpp::Time entry_time_;
+
+    MotionCommand advanceSweep(double yaw_speed, double centre_yaw, double sweep_half,
+                               float advance_surge, double advance_budget,
+                               double settle_left, double dt);
 };
 
 class ApproachTarget : public BT::ActionNodeBase {

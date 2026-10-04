@@ -40,13 +40,39 @@
            Fallback + AlwaysSuccess 讓 BlindForward「無論如何都會執行」：門就在
            正前方約 16 m，90 秒認不出來的話瞎衝過去仍有機會，總比原地轉完 15
            分鐘好。⚠ 代價是搜尋逾時後艇的航向是掃描停在哪就是哪，盲走方向不
-           保證朝著門，也可能撞上池壁（−5）。這是刻意接受的賭注。 -->
+           保證朝著門，也可能撞上池壁（−5）。這是刻意接受的賭注。
+
+           前進掃描：去程與回程共用這棵子樹，但要的掃描中心與前進預算不同，
+           所以由呼叫端用 SetBlackboard 設 gate_heading_deg / gate_budget_sec，
+           並以 __shared_blackboard="true" 呼叫本子樹，讓這裡直接讀父樹的黑板。
+           ⚠ 不能改用 SubTree 屬性傳值：在本機的 BT.CPP v3（humble）上，
+           `<SubTree h="{h}"/>` 與 `<SubTree h="0"/>` 兩種寫法都只會在子樹黑板
+           留下一個空 entry，getInput 回「found, but its content was not
+           initialized」（2026-10-02 以最小測試樹逐一驗證過）。
+           呼叫端忘了設這兩個 key 時，SearchTarget 會印 ERROR 並退回原地轉圈。
+           advance_surge 12：介於 ApproachTarget 的盲推 8 與上限 20 之間。
+           預算是秒數不是距離，換算見 FinalMission 呼叫端。
+
+           gate_acquired：找門段結束（成功或 90 s 逾時都算）就設 true。外層
+           ReactiveFallback 的 AvoidObstacle 一觸發會 halt 整棵子樹，Sequence
+           回到第 0 個子節點 —— 沒有這個旗標的話，盲走途中避障一次就會回頭
+           重新找門（seed 2 校正跑：門已經在身後，又找了 58 秒）。加上前進掃描
+           後這更危險：去程中心 0° 會朝對面池壁推進去找一個在背後的門。
+           有了旗標，重新進來直接跳到 BlindForward，它本來就跨 halt 累計已走
+           時間、保留鎖定航向，等於從中斷處接著走。呼叫端每次進來前要把它
+           設回 false。 -->
       <Fallback>
+        <BlackboardCheckString value_A="{gate_acquired}" value_B="true"
+                               return_on_mismatch="FAILURE">
+          <AlwaysSuccess/>
+        </BlackboardCheckString>
         <Timeout msec="90000">
           <RetryUntilSuccessful num_attempts="6">
             <Sequence>
               <Timeout msec="30000">
-                <SearchTarget label="gate"/>
+                <SearchTarget label="gate" heading_deg="{gate_heading_deg}"
+                              sweep_half_deg="60" advance_surge="12"
+                              advance_budget_sec="{gate_budget_sec}"/>
               </Timeout>
               <Timeout msec="60000">
                 <ApproachTarget label="gate" distance="3.0"/>
@@ -57,6 +83,7 @@
         </Timeout>
         <AlwaysSuccess/>
       </Fallback>
+      <SetBlackboard output_key="gate_acquired" value="true"/>
       <!-- 決賽專用時長：16.0 秒 -->
       <BlindForward duration="16.0" heading_lock="true"/>
     </Sequence>
@@ -274,9 +301,17 @@
         <SetCamera mode="realsense"/>
         <SetDepth zone="gate"/>
 
+        <!-- 去程前進掃描：中心 0°（出發時艇頭正對門），預算 47 s ≈ 8 m。
+             秒數→距離用實測值換算：calib_advance_seed2_v2 回程那段 9.2 s 前進
+             1.54 m，即擺動中 surge 12 ≈ 0.17 m/s（含起步加速）。門在前方約 15 m，
+             8 m 留了足夠餘裕，不會在沒看到門的情況下衝過門線。
+             途經橘 flare 區，由外層 AvoidObstacle 擋。 -->
+        <SetBlackboard output_key="gate_heading_deg" value="0"/>
+        <SetBlackboard output_key="gate_acquired" value="false"/>
+        <SetBlackboard output_key="gate_budget_sec" value="47"/>
         <ReactiveFallback>
           <AvoidObstacle sticky_time="1.0"/>
-          <SubTree ID="PassGateFinalsProcedure"/>
+          <SubTree ID="PassGateFinalsProcedure" __shared_blackboard="true"/>
         </ReactiveFallback>
 
         <!-- 投球區池深約 1.20 m，桶高 0.30 m 坐池底 → 桶口在水深 0.90 m。
@@ -312,9 +347,18 @@
              blind_forward.cpp）：ReactiveFallback 觸發避障時會 halt 整棵過門子
              樹，盲走跟著中斷。修好之前每中斷一次就多走一趟完整的 10 秒，補在
              回程只會把那個坑挖成兩個。 -->
+        <!-- 回程前進掃描：中心 180°（朝起點方向），預算 18 s ≈ 3 m（0.17 m/s，
+             換算見去程呼叫端）。
+             投球後艇停在桶附近（模擬批次 x≈5.6~6.9 或 10~12.4，門在 x=3.5），
+             近的那一組離門只剩 2~3 m，預算給大了會在沒看到門時穿過門線、
+             進到柱外與橘 flare 區，所以刻意比去程小很多。
+             若艇一進來就背對門，會先「回正」到 180° 扇區，回正期間不前進。 -->
+        <SetBlackboard output_key="gate_heading_deg" value="180"/>
+        <SetBlackboard output_key="gate_acquired" value="false"/>
+        <SetBlackboard output_key="gate_budget_sec" value="18"/>
         <ReactiveFallback>
           <AvoidObstacle sticky_time="1.0"/>
-          <SubTree ID="PassGateFinalsProcedure"/>
+          <SubTree ID="PassGateFinalsProcedure" __shared_blackboard="true"/>
         </ReactiveFallback>
 
         <!-- 撞柱刻意「沒有」入口守衛。這段是逐根計分的（每根 20 分獨立入袋，
@@ -394,10 +438,31 @@
       <!-- P0-3：同 PassGateFinalsProcedure。num_attempts 從 60 降到 6，是因為
            加上 Timeout 之後這個數字才第一次真的生效 —— 6 × (30 s 搜 + 60 s 接近)
            已經是 9 分鐘，60 次會把整場 900 秒燒光。 -->
+      <!-- 前進掃描：中心 0°（過門後繼續往桶區），預算 7 s ≈ 1.2 m（0.17 m/s，
+           換算見 FinalMission 去程呼叫端）。
+           batch_flare5x_cam120 實測：進到這裡時艇在 x=6.4~9.3，離對面池壁
+           3.2~6.1 m，桶列在 x≈11.3~11.7 —— 最近的情況前方只剩約 2 m 可走
+           （碰壁 −5/次），所以預算壓得最小。桶的方位常在 ±45~75°、距離
+           3~9 m，這段的瓶頸主要是偵測率，前進只是小幅輔助。
+           掃描中心以 mission_start_yaw 為準，不受盲走結束時的航向影響。
+
+           yaw_speed 0.2 → 0.45（與撞柱段相同）。0.2 由 dbde654 引入、沒有記錄
+           理由；batch_advance_sweep 實測原地轉圈只有約 2.4°/s（貼牆時更低到
+           約 0.75°/s），6 次 × 30 s 的搜尋最多只轉得過約 135°，桶常在 ±45~75°
+           之外就根本轉不到。seed 1/7/9/11 找桶各耗 3~5 分鐘，找桶平均 170 s
+           是全場最長 —— 這原本被歸成「偵測率低」，至少有一部分是轉太慢。
+
+           settle_sec 5：每次進來前 5 秒只轉不推（照常掃描、不扣預算）。這段緊接
+           在 BlindForward（surge 25）之後，艇還帶著約 0.5 m/s 的慣性 ——
+           batch_advance_sweep seed 1 的 7 s 前進實際走了 2.1 m（設計 1.2 m），
+           把艇推進側牆與端牆的角落卡住。batch_flare5x_cam120 盲走後的滑行速度：
+           0~2 s 最高 0.60、2~4 s 最高 0.37、4~6 s 最高 0.04 m/s，5 s 足以歸零。 -->
       <RetryUntilSuccessful num_attempts="6">
         <Sequence>
           <Timeout msec="30000">
-            <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+            <SearchTarget label="blue_drum" yaw_speed="0.45" heading_deg="0"
+                          sweep_half_deg="60" advance_surge="12" advance_budget_sec="7"
+                          settle_sec="5"/>
           </Timeout>
           <Timeout msec="60000">
             <ApproachTarget label="blue_drum" distance="4.0"/>
@@ -442,6 +507,14 @@
          debug_msg，跑一次就能看到柱子在各距離的實際框高，再回頭修這個數字。 -->
   <BehaviorTree ID="CommunicationTask">
     <Sequence>
+      <!-- 三個 SearchTarget 刻意「不」用前進掃描（不填 heading_deg，維持原地
+           轉圈）。batch_flare5x_cam120 中回程有過門的各次，進到這裡時目標
+           flare 多在 2~7 m、方位常在側後方（相對 180° 為 ±110~165°），原地
+           360° 本來就看得到；反而橘 flare 常落在 180° 的 ±50° 扇區內、5~10 m
+           遠 —— 往 180° 推進是遠離目標、靠近唯一會「碰到即終止」的道具。
+           這段也沒有 AvoidObstacle 可以包：它會把要撞的那根也當障礙物
+           （ApproachTarget 要 220 px、避障 200 px 就觸發），且觸發時 halt 整個
+           Sequence，恢復後會從 WaitForFlareOrder 重跑。 -->
       <WaitForFlareOrder/>
 
       <Fallback>
@@ -547,7 +620,8 @@
       <RetryUntilSuccessful num_attempts="4">
         <Sequence>
           <Timeout msec="45000">
-            <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+            <!-- yaw_speed 0.45：理由同 TargetAcquisition（0.2 轉太慢）。 -->
+            <SearchTarget label="blue_drum" yaw_speed="0.45"/>
           </Timeout>
           <Timeout msec="60000">
             <ApproachTarget label="blue_drum" distance="4.0"/>
