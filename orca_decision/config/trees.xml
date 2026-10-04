@@ -444,12 +444,25 @@
            3.2~6.1 m，桶列在 x≈11.3~11.7 —— 最近的情況前方只剩約 2 m 可走
            （碰壁 −5/次），所以預算壓得最小。桶的方位常在 ±45~75°、距離
            3~9 m，這段的瓶頸主要是偵測率，前進只是小幅輔助。
-           掃描中心以 mission_start_yaw 為準，不受盲走結束時的航向影響。 -->
+           掃描中心以 mission_start_yaw 為準，不受盲走結束時的航向影響。
+
+           yaw_speed 0.2 → 0.45（與撞柱段相同）。0.2 由 dbde654 引入、沒有記錄
+           理由；batch_advance_sweep 實測原地轉圈只有約 2.4°/s（貼牆時更低到
+           約 0.75°/s），6 次 × 30 s 的搜尋最多只轉得過約 135°，桶常在 ±45~75°
+           之外就根本轉不到。seed 1/7/9/11 找桶各耗 3~5 分鐘，找桶平均 170 s
+           是全場最長 —— 這原本被歸成「偵測率低」，至少有一部分是轉太慢。
+
+           settle_sec 5：每次進來前 5 秒只轉不推（照常掃描、不扣預算）。這段緊接
+           在 BlindForward（surge 25）之後，艇還帶著約 0.5 m/s 的慣性 ——
+           batch_advance_sweep seed 1 的 7 s 前進實際走了 2.1 m（設計 1.2 m），
+           把艇推進側牆與端牆的角落卡住。batch_flare5x_cam120 盲走後的滑行速度：
+           0~2 s 最高 0.60、2~4 s 最高 0.37、4~6 s 最高 0.04 m/s，5 s 足以歸零。 -->
       <RetryUntilSuccessful num_attempts="6">
         <Sequence>
           <Timeout msec="30000">
-            <SearchTarget label="blue_drum" yaw_speed="0.2" heading_deg="0"
-                          sweep_half_deg="60" advance_surge="12" advance_budget_sec="7"/>
+            <SearchTarget label="blue_drum" yaw_speed="0.45" heading_deg="0"
+                          sweep_half_deg="60" advance_surge="12" advance_budget_sec="7"
+                          settle_sec="5"/>
           </Timeout>
           <Timeout msec="60000">
             <ApproachTarget label="blue_drum" distance="4.0"/>
@@ -607,7 +620,8 @@
       <RetryUntilSuccessful num_attempts="4">
         <Sequence>
           <Timeout msec="45000">
-            <SearchTarget label="blue_drum" yaw_speed="0.2"/>
+            <!-- yaw_speed 0.45：理由同 TargetAcquisition（0.2 轉太慢）。 -->
+            <SearchTarget label="blue_drum" yaw_speed="0.45"/>
           </Timeout>
           <Timeout msec="60000">
             <ApproachTarget label="blue_drum" distance="4.0"/>
