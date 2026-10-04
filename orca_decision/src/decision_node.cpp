@@ -579,11 +579,19 @@ void DecisionNode::perceptionCallback(
 
 void DecisionNode::startMissionCallback(
     const std_msgs::msg::Bool::SharedPtr msg) {
+  const bool was_started = ctx_->mission_started;
   ctx_->mission_started = msg->data;
   if (ctx_->mission_started) {
     mission_complete_ = false;  // allow BT to run again
     ctx_->mission_start_time = this->now();
-    RCLCPP_INFO(this->get_logger(), "Mission Started!");
+    // 只在 false→true 那一下取起始航向。開始訊號會重複送（批次工具用
+    // `ros2 topic pub -t 5 -r 2` 連發防掉訊），第一則到達後樹就開始轉了，
+    // 後面幾則若也重取，基準會變成「已經轉了一點」的航向。
+    if (!was_started) {
+      ctx_->mission_start_yaw = ctx_->world_model->getYaw();
+    }
+    RCLCPP_INFO(this->get_logger(), "Mission Started! start_yaw=%.1f deg",
+                ctx_->mission_start_yaw * 180.0 / M_PI);
   } else {
     RCLCPP_INFO(this->get_logger(), "Mission Stopped!");
     // Reset command

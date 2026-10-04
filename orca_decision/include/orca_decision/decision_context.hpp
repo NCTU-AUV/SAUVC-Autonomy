@@ -18,6 +18,11 @@ struct DecisionContext {
     // Some common state flags
     bool mission_started = false;
     rclcpp::Time mission_start_time;
+    // 任務開始那一刻的 yaw（rad）。這是「場地座標」的唯一來源：位置是 IMU
+    // 加速度積兩次，會漂到不能用，但航向可以信。出發時艇頭正對閘門，所以
+    // 「相對 mission_start_yaw 0°」= 朝門、180° = 朝起點。實機出發前要把艇頭
+    // 擺正，否則所有以它為基準的航向都會一起偏。
+    double mission_start_yaw = 0.0;
     std::string current_flare_order = "";
 
     // State for DecisionStatus
