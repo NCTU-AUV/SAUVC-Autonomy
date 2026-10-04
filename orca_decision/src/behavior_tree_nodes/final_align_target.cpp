@@ -31,11 +31,19 @@ BT::NodeStatus FinalAlignTarget::tick() {
 
   auto obj = ctx_->world_model->getObjectNearestImageCenter(label, centre_x, centre_y);
   if (!obj.has_value()) {
-    aligning_ = false;
-    ctx_->debug_msg = "Target lost: " + label;
+    lost_frames_++;
+    ctx_->debug_msg = "Target lost: " + label + " (" + std::to_string(lost_frames_) + "/8)";
+    if (lost_frames_ > 8) {
+      lost_frames_ = 0;
+      aligning_ = false;
+      ctx_->wrench_adapter->setCommand(MotionCommand());
+      return BT::NodeStatus::FAILURE;
+    }
     ctx_->wrench_adapter->setCommand(MotionCommand());
-    return BT::NodeStatus::FAILURE;
+    return BT::NodeStatus::RUNNING;
   }
+  
+  lost_frames_ = 0;
 
   ctx_->debug_msg = "Aligning to: " + label;
 
@@ -50,7 +58,7 @@ BT::NodeStatus FinalAlignTarget::tick() {
       align_start_time_ = ctx_->node->now();
     } else {
       auto elapsed = (ctx_->node->now() - align_start_time_).seconds();
-      if (elapsed >= 0.1) {
+      if (elapsed >= 0.15) {
         aligning_ = false;
         ctx_->wrench_adapter->setCommand(MotionCommand());
         return BT::NodeStatus::SUCCESS;
@@ -60,10 +68,14 @@ BT::NodeStatus FinalAlignTarget::tick() {
     aligning_ = false;
   }
 
-  // Align logic
+  // Align logic with deadband and damping to prevent yaw hunting/oscillation
   MotionCommand cmd;
   cmd.surge = 0.0f;
-  cmd.yaw = -0.005f * error_x;
+  if (std::abs(error_x) < 12.0f) {
+    cmd.yaw = 0.0f; // Inside deadband: zero torque to let hydrodynamic drag stabilize
+  } else {
+    cmd.yaw = std::clamp(-0.003f * error_x, -0.25f, 0.25f);
+  }
 
   ctx_->wrench_adapter->setCommand(cmd);
 
@@ -72,6 +84,7 @@ BT::NodeStatus FinalAlignTarget::tick() {
 
 void FinalAlignTarget::halt() {
   aligning_ = false;
+  lost_frames_ = 0;
   if (ctx_) {
     ctx_->wrench_adapter->setCommand(MotionCommand());
   }

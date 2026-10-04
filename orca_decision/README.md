@@ -35,6 +35,15 @@ The node subscribes to perception output (`orca_interface/PerceptionArray`) and 
 | `SetCamera` | Action | Switch the active camera mode (`realsense` / `usb`). |
 | `SetDepth` | Action | Publish a desired depth target. |
 | `AvoidObstacle` | Condition/Action | Reactive obstacle avoidance with sticky cooldown. |
+| `SearchGateByPosts` | Action | Rotate to search until two post-shaped boxes form a gate pair. |
+| `ApproachGateByPosts` | Action | Approach the midpoint of a post pair; falls back to post separation when depth fails. |
+| `AlignGateByPosts` | Action | Fine yaw alignment onto the midpoint of a post pair. |
+
+All three take a `label` port holding a **comma-separated** list, and the two posts of a pair
+need not share a label — `label="gate"` for a 1-class model, or
+`label="red_flare,blue_flare,yellow_flare,orange_flare"` to pick the gate out of whichever
+flare colours the 7-class model assigns to its posts. Colour classes are unreliable under
+uneven underwater lighting, which is exactly why a pair may be mixed.
 
 ## Configuration
 
@@ -50,16 +59,32 @@ The node subscribes to perception output (`orca_interface/PerceptionArray`) and 
 | `perception_timeout_sec` | 1.0 | Drop tracked objects unseen for this long |
 | `velocity_decay` | 0.95 | Per-step velocity decay (drag model) |
 | `tree_xml_file` | `config/trees.xml` | Path to BehaviorTree XML |
-| `main_tree_id` | `QualificationMission` | Root tree to execute |
+| `main_tree_id` | `FinalMission` | Root tree to execute |
 | `align_yaw_threshold` | 0.1 | Yaw alignment tolerance (rad) |
 | `align_distance_threshold` | 0.5 | Distance alignment tolerance (m) |
 | `status_json_rate_hz` | 5.0 | Rate of the JSON status mirror; 0 disables it |
+| `gate_post_min_aspect_ratio` | 1.8 | height/width a box must exceed to count as a gate post |
+| `gate_post_min_gap_px` | 40.0 | Minimum post separation for a valid pair |
+| `gate_post_max_gap_px` | 520.0 | Maximum post separation (rejects posts of two different gates) |
+| `gate_post_max_height_ratio` | 1.8 | Max taller/shorter box-height ratio within a pair |
+| `gate_posts_success_gap_px` | 230.0 | Post separation standing in for `distance` when depth is unresolved |
 
 ### Mission Trees (`config/trees.xml`)
 
-- **QualificationMission** — Submerge → pass gate → U-turn → return → surface.
+- **QualificationMission** — Submerge → pass gate → U-turn → pass gate again → surface.
+- **QualificationMissionBlindReturn** — Same outbound leg, but after the U-turn it blind-runs
+  straight back through the gate instead of re-acquiring it. Tune the return `BlindForward`
+  duration first; it has to cover the outbound blind run plus the 3 m approach standoff.
 - **FinalMission** — Extended mission with obstacle avoidance.
 - **PassGateProcedure** — Reusable sub-tree: search → approach → align → blind forward.
+- **QualificationMissionGateOrFlares** — Whole-gate detection first; if it fails to acquire
+  within 90 s, falls back to pairing post-shaped boxes. Then U-turn, blind return, surface.
+  Works under either model: the fallback accepts `gate` (1-class) and every flare colour
+  (7-class) in one label list, so the same tree covers both.
+- **PassGateWithPostPairFallbackProcedure** — `AcquireGateWholeBox` under a 90 s cap, falling
+  back to `AcquireGateByPostPair`, then a blind run through. The cap is load-bearing:
+  `SearchTarget` returns RUNNING forever when it sees nothing, so without it the fallback
+  branch is unreachable.
 
 ## Launch
 

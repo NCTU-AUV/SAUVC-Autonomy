@@ -17,7 +17,9 @@ BT::NodeStatus SkipFlare::tick() {
     if (ctx_) {
         ctx_->current_action = name();
         ctx_->debug_msg = "SkipFlare: flare not found, skipping";
-        RCLCPP_WARN(ctx_->node->get_logger(), "SkipFlare: skipping current flare");
+        RCLCPP_WARN(ctx_->node->get_logger(),
+                    "SkipFlare: Failed to find/align [%s] after retries, skipping current flare",
+                    ctx_->target_label.c_str());
     }
 
     return BT::NodeStatus::SUCCESS;

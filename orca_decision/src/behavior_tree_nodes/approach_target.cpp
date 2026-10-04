@@ -14,8 +14,8 @@ constexpr float kMaxSurge = 20.0f;
 // turned "already too close" into a full-speed charge.
 constexpr float kMinSurge = 2.0f;
 // Ticks to keep closing in on a target whose depth never resolves before giving
-// up. The BT ticks at 10 Hz (decision_node.cpp), so 60 is 6 s.
-constexpr int kMaxBlindFrames = 60;
+// up. The BT ticks at 10 Hz (decision_node.cpp), so 300 is 30 s.
+constexpr int kMaxBlindFrames = 300;
 }  // namespace
 
 ApproachTarget::ApproachTarget(const std::string &name,
@@ -24,7 +24,13 @@ ApproachTarget::ApproachTarget(const std::string &name,
 
 BT::PortsList ApproachTarget::providedPorts() {
   return {BT::InputPort<std::string>("label"),
-          BT::InputPort<double>("distance")};
+          BT::InputPort<double>("distance"),
+          // 深度失效時的備援到位判準：偵測框高度（640 張量像素）達到這個值就
+          // 算走到了。0 = 停用，維持原本「只認深度」的行為，所以既有呼叫端
+          // （閘門、藍桶）完全不受影響。
+          BT::InputPort<double>("min_height_px", 0.0,
+                                "Bbox height (px) that counts as arrival when "
+                                "depth is unavailable; 0 disables")};
 }
 
 BT::NodeStatus ApproachTarget::tick() {
@@ -38,6 +44,9 @@ BT::NodeStatus ApproachTarget::tick() {
       !getInput<double>("distance", target_distance)) {
     throw BT::RuntimeError("missing required inputs");
   }
+
+  double min_height_px = 0.0;
+  getInput<double>("min_height_px", min_height_px);
 
   ctx_->current_action = name();
   ctx_->target_label = label;
@@ -56,17 +65,18 @@ BT::NodeStatus ApproachTarget::tick() {
     if (lost_frames_ > 8) {
       lost_frames_ = 0;
       blind_frames_ = 0;
+      height_stable_frames_ = 0;
       stable_frames_ = 0;
       ctx_->wrench_adapter->setCommand(MotionCommand());
       return BT::NodeStatus::FAILURE;
     }
-    // Maintain current command or stop? If we just return RUNNING without setting command, it keeps the last command or we can just send zero wrench.
-    // The prompt just says return failure only if for more than 5 frames in sequence. We should return RUNNING in the meantime.
-    ctx_->wrench_adapter->setCommand(MotionCommand()); // stop while lost but waiting? or don't set command? Setting to zero is safer.
+    ctx_->wrench_adapter->setCommand(MotionCommand());
     return BT::NodeStatus::RUNNING;
   }
   
   lost_frames_ = 0;
+
+  float error_x = centre_x - obj->cx;
 
   ctx_->debug_msg = "Approaching: dist=" + std::to_string(obj->distance);
 
@@ -85,47 +95,70 @@ BT::NodeStatus ApproachTarget::tick() {
   // Approach logic
   MotionCommand cmd;
 
-  // Yaw correction from the box centre. cx is an absolute pixel column in the
-  // 640-wide tensor. A target right of centre gives error_x < 0 and therefore
-  // a positive yaw command, which is a starboard turn in this stack's
-  // down-positive frame — towards the target. (Verified against the simulator:
-  // positive torque.z yaws the vehicle to starboard.)
-  float error_x = centre_x - obj->cx;
-  cmd.yaw = -0.005f * error_x; // simple P control
+  // Yaw correction with deadband and clamping to avoid aggressive oscillation
+  if (std::abs(error_x) < 15.0f) {
+    cmd.yaw = 0.0f; // within deadband, zero command
+  } else {
+    cmd.yaw = std::clamp(-0.0035f * error_x, -0.3f, 0.3f);
+  }
 
   // Forward movement (decelerate as we get closer).
-  //
-  // The three cases have to stay separate. Folding "no depth yet" and "already
-  // too close" into a single `dist_error = 1000` mapped both onto *maximum*
-  // surge — so being closer than requested commanded a full-speed charge into
-  // the target, and in usb camera mode (distance is always -1.0 there) the
-  // vehicle drove blind at full speed for the node's whole lifetime.
   if (obj->distance <= 0.0f) {
-    // Depth not resolved yet — close in gently so the target grows in frame
-    // until the depth estimate becomes valid, rather than charging at it.
+    // 視覺備援到位判準。沒有這一段的話 blind 分支「只能失敗」：SUCCESS 唯一的
+    // 出口在上面，而那裡要求 distance > 0，所以深度一直估不出來時這個節點必然
+    // 盲衝滿 kMaxBlindFrames 然後回 FAILURE。
     //
-    // This branch can never SUCCEED (that needs distance > 0) and never FAILS
-    // on its own (the target is visible, so lost_frames_ stays 0), so it needs
-    // its own way out: depth_perception publishes -1.0 for every rejected gate
-    // estimate and for every frame before the depth image arrives, and a frozen
-    // depth stream makes that permanent. Without the counter the vehicle drives
-    // into whatever it is looking at.
+    // flare 正好是最會踩到這件事的目標：桿子直徑 1.6 cm，細長框裡取到的深度多
+    // 半是背景或根本沒有有效點（depth_perception_node 的 _estimate_object 回
+    // NaN → distance = −1）。三根柱子每根 retry 三次全數失敗 → SkipFlare，
+    // 60 分整包歸零。
+    //
+    // 用框高而不是框寬，是因為桿子在畫面上就是「高、窄」，寬度只有幾像素、量
+    // 化雜訊佔比極高，高度才是隨距離單調變化又量得準的那一維。做法與倉庫裡既
+    // 有的 gate_posts_success_gap_px 同一套路：深度不可靠時退回像素幾何。
+    if (min_height_px > 0.0 &&
+        static_cast<double>(obj->height) >= min_height_px) {
+      height_stable_frames_++;
+      if (height_stable_frames_ >= 5) {
+        blind_frames_ = 0;
+        height_stable_frames_ = 0;
+        stable_frames_ = 0;
+        ctx_->wrench_adapter->setCommand(MotionCommand());
+        ctx_->debug_msg = "Arrived (visual): " + label + " h=" +
+                          std::to_string(obj->height) + " >= " +
+                          std::to_string(min_height_px);
+        return BT::NodeStatus::SUCCESS;
+      }
+    } else {
+      height_stable_frames_ = 0;
+    }
+
     blind_frames_++;
-    ctx_->debug_msg = "Approaching blind: " + label + " (" +
+    ctx_->debug_msg = "Approaching (visual): " + label + " (h=" +
+                      std::to_string(obj->height) + ", " +
                       std::to_string(blind_frames_) + "/" +
                       std::to_string(kMaxBlindFrames) + ")";
     if (blind_frames_ > kMaxBlindFrames) {
       blind_frames_ = 0;
+      height_stable_frames_ = 0;
       stable_frames_ = 0;
       ctx_->wrench_adapter->setCommand(MotionCommand());
       return BT::NodeStatus::FAILURE;
     }
-    cmd.surge = kBlindSurge;
+    if (std::abs(error_x) > 60.0f) {
+      cmd.surge = 0.0f; // Turn first if significantly off-center
+    } else {
+      cmd.surge = kBlindSurge;
+    }
   } else {
     blind_frames_ = 0;
+    height_stable_frames_ = 0;
     const float dist_error = obj->distance - target_distance;
     if (dist_error <= 0.0f) {
       // Overshot: coast to a stop instead of pushing further in.
+      cmd.surge = 0.0f;
+    } else if (std::abs(error_x) > 60.0f) {
+      // Too far off-center: turn first, don't drive in an arc
       cmd.surge = 0.0f;
     } else {
       cmd.surge = std::clamp(8.0f * dist_error, kMinSurge, kMaxSurge);
@@ -145,6 +178,7 @@ void ApproachTarget::halt() {
   stable_frames_ = 0;
   lost_frames_ = 0;
   blind_frames_ = 0;
+  height_stable_frames_ = 0;
   if (ctx_) {
     ctx_->wrench_adapter->setCommand(MotionCommand());
   }

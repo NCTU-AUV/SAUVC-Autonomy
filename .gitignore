@@ -1,6 +1,11 @@
 **/.git/
 **/__pycache__/
 
+# colcon 產物
+build/
+install/
+log/
+
 test_utils/
 
 .vscode/

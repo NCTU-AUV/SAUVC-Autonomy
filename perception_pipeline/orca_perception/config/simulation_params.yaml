@@ -112,10 +112,10 @@ dnn_image_encoder:
     obj_min_roi_points:     5       # minimum valid depth pixels to trust estimate
 
     # --- Multi-frame stability tracker ---
-    stability_window:         10    # rolling window length (frames)
-    stability_min_hits:       7     # min detections in window to be considered stable
-    stability_pos_std_thresh: 0.15  # max position std-dev (m) over window
-    stability_conf_thresh:    0.35  # min confidence to count toward stability
+    stability_window:         6     # rolling window length (frames)
+    stability_min_hits:       2     # min detections in window to be considered stable
+    stability_pos_std_thresh: 0.30  # max position std-dev (m) over window
+    stability_conf_thresh:    0.25  # min confidence to count toward stability
 
 # ── Depth perception viz node (only active when use_viz: true) ────────────────
 /depth_perception_viz:
